@@ -9,9 +9,9 @@ class MethodChannelShorts extends ShortsPlatform {
   Stream<ShortsEvent>? _cached;
   void Function(String, Map)? _mh;
 
-
   @override
-  Future<void> init({ShortsInitConfig config = const ShortsInitConfig()}) async {
+  Future<void> init(
+      {ShortsInitConfig config = const ShortsInitConfig()}) async {
     await _ch.invokeMethod('init', config.toMap());
   }
 
@@ -110,20 +110,40 @@ class MethodChannelShorts extends ShortsPlatform {
   void setMethodCallHandler(void Function(String, Map args) handler) {
     _mh = handler;
     _ch.setMethodCallHandler((call) async {
-      final args = (call.arguments as Map?)?.cast<String, Object?>() ?? const {};
+      final args =
+          (call.arguments as Map?)?.cast<String, Object?>() ?? const {};
       handler(call.method, args);
     });
   }
 
+  @override
+  Future<void> togglePlayPause(int index) =>
+      _ch.invokeMethod('togglePlayPause', {'index': index});
 
-  @override Future<void> togglePlayPause(int index) => _ch.invokeMethod('togglePlayPause', {'index': index});
-  @override Future<void> setMuted(bool value) => _ch.invokeMethod('setMuted', {'muted': value});
-  @override Future<void> setVolume(double value) => _ch.invokeMethod('setVolume', {'volume': value});
-  @override Future<void> setLooping(bool value) => _ch.invokeMethod('setLooping', {'looping': value});
-  @override Future<bool> isPaused(int index) async => (await _ch.invokeMethod('isPaused', {'index': index})) as bool;
+  @override
+  Future<void> setMuted(bool value) =>
+      _ch.invokeMethod('setMuted', {'muted': value});
 
-  @override Future<void> setProgressTracking({required bool enabled, int? intervalMs}) =>
-      _ch.invokeMethod('setProgressTracking', {'enabled': enabled, if (intervalMs != null) 'intervalMs': intervalMs});
+  @override
+  Future<void> setVolume(double value) =>
+      _ch.invokeMethod('setVolume', {'volume': value});
 
-  @override Future<void> primeSingle(int index) => _ch.invokeMethod('prime', {'index': index});
+  @override
+  Future<void> setLooping(bool value) =>
+      _ch.invokeMethod('setLooping', {'looping': value});
+
+  @override
+  Future<bool> isPaused(int index) async =>
+      (await _ch.invokeMethod('isPaused', {'index': index})) as bool;
+
+  @override
+  Future<void> setProgressTracking({required bool enabled, int? intervalMs}) =>
+      _ch.invokeMethod('setProgressTracking', {
+        'enabled': enabled,
+        if (intervalMs != null) 'intervalMs': intervalMs
+      });
+
+  @override
+  Future<void> primeSingle(int index) =>
+      _ch.invokeMethod('prime', {'index': index});
 }

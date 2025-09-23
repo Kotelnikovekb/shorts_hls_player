@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 
 import 'platform_interface.dart';
 import 'types.dart';
@@ -60,7 +61,6 @@ class ShortsController with ChangeNotifier {
       ),
     );
 
-    // если хочешь принудительно выставить qualityPreset отдельно (необязательно)
     // await _p.setQualityPreset(qualityPreset);
 
     _initialized = true;
@@ -71,7 +71,7 @@ class ShortsController with ChangeNotifier {
   Future<void> append(List<Uri> urls) =>
       _p.append(urls.map((e) => e.toString()).toList());
 
-  Future<void> prewarmAround(
+/*  Future<void> prewarmAround(
     int index, {
     int forward = 1,
     int backward = 1,
@@ -83,6 +83,41 @@ class ShortsController with ChangeNotifier {
     for (int i = 1; i <= backward; i++) {
       await _p.prime(index - i);
     }
+  }*/
+
+  Future<void> prewarmAround(
+      int index, {
+        int forward = 1,
+        int backward = 1,
+      }) async {
+    // helper: безопасно вызвать prime, игнорируя невалидные индексы/ошибки
+    Future<void> _safePrime(int i) async {
+      if (i < 0) return; // НЕ шлём отрицательные индексы -> не ловим INVALID_INDEX
+      try {
+        await _p.prime(i); // твой method_channel_impl.dart занимается нативом
+      } on PlatformException {
+        // best-effort прелоад: молча игнорируем
+      } catch (_) {
+        // на всякий случай гасим и прочее
+      }
+    }
+
+    // текущий
+    await _safePrime(index);
+
+    // вперёд
+    final futures = <Future<void>>[];
+    for (int i = 1; i <= forward; i++) {
+      futures.add(_safePrime(index + i));
+    }
+    // назад
+    for (int i = 1; i <= backward; i++) {
+      final prev = index - i;
+      if (prev < 0) break; // дальше только отрицательные — сразу выходим
+      futures.add(_safePrime(prev));
+    }
+
+    await Future.wait(futures);
   }
 
   Future<void> onActive(int index) async {
