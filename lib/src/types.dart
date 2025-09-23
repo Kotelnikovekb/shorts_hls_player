@@ -1,5 +1,34 @@
 enum ShortsQuality { auto, p360, p480, p720, p1080, best }
 
+class ShortsInitConfig {
+  final bool looping;
+  final bool muted;
+  final double volume;
+  final ShortsQuality? quality;
+  final bool progressEnabled;
+  final Duration? progressInterval;
+
+  const ShortsInitConfig({
+    this.looping = false,
+    this.muted = false,
+    this.volume = 1.0,
+    this.quality,
+    this.progressEnabled = false,
+    this.progressInterval,
+  });
+
+  Map<String, Object?> toMap() => {
+    'looping': looping,
+    'muted': muted,
+    'volume': volume,
+    if (quality != null) 'qualityPreset': quality!.name,
+    'progressTracking': {
+      'enabled': progressEnabled,
+      if (progressInterval != null) 'intervalMs': progressInterval!.inMilliseconds,
+    }
+  };
+}
+
 class ShortsVariant {
   final int? height; // 360, 480, 720...
   final int? width;

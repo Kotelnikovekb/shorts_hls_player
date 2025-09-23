@@ -20,6 +20,16 @@ final class PlayerItemHost {
   var onStall: ((Int) -> Void)?
   var onProgress: ((Int, Int, Int?) -> Void)? // index, posMs, durMs
   var onError: ((Int, String) -> Void)?
+  var onCompleted: ((Int) -> Void)?
+    var progressInterval: Int = 500 { // ms
+      didSet {
+        if let timeObs = timeObs {
+          player.removeTimeObserver(timeObs)
+          self.timeObs = nil
+        }
+        attachProgressObserver()
+      }
+    }
 
   // observers
   private var kvo: [NSKeyValueObservation] = []
@@ -186,6 +196,17 @@ final class PlayerItemHost {
       }()
       self.onProgress?(self.index, pos, dur)
     }
+      
+      let tokEnd = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main
+          ) { [weak self] _ in
+            guard let self = self else { return }
+            self.onCompleted?(self.index)
+          }
+          notifTokens.append(tokEnd)
+
+          // progress
+          attachProgressObserver()
 
     kvo = [obsStatus, obsEmpty, obsKeepUp]
     notifTokens = [tokStall]
@@ -201,6 +222,19 @@ final class PlayerItemHost {
     notifTokens.forEach { NotificationCenter.default.removeObserver($0) }
     notifTokens.removeAll()
   }
+    private func attachProgressObserver() {
+      let timescale: Int32 = 1000
+      let interval = CMTimeMake(value: Int64(progressInterval), timescale: timescale)
+      timeObs = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] t in
+        guard let self = self else { return }
+        let pos = Int(CMTimeGetSeconds(t) * 1000)
+        let dur: Int? = {
+          if let s = self.secondsIfFinite(self.item.duration) { return Int(s * 1000) }
+          return nil
+        }()
+        self.onProgress?(self.index, pos, dur)
+      }
+    }
 
   // MARK: - Helpers
 

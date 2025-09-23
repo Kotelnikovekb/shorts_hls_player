@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 import 'method_channel_impl.dart';
 import 'types.dart';
@@ -15,7 +17,7 @@ abstract class ShortsPlatform extends PlatformInterface {
   }
 
   // core
-  Future<void> init();
+  Future<void> init({ShortsInitConfig config = const ShortsInitConfig()});
 
   Future<void> append(List<String> urls);
 
@@ -41,4 +43,22 @@ abstract class ShortsPlatform extends PlatformInterface {
   // view handle for iOS UiKitView
   Future<int> createView(int index); // returns viewId
   Stream<ShortsEvent> events();
+
+  Future<Uint8List?> getThumbnail(int index);
+
+  Future<void> togglePlayPause(int index);
+
+  Future<void> setMuted(bool value);
+
+  Future<void> setVolume(double value);
+
+  Future<void> setLooping(bool value);
+
+  Future<bool> isPaused(int index);
+
+  Future<void> setProgressTracking({required bool enabled, int? intervalMs});
+  void setMethodCallHandler(void Function(String method, Map args) handler);
+  Future<void> primeSingle(int index);
+
+
 }
