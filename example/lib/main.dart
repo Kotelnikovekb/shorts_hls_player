@@ -148,6 +148,19 @@ class _DemoHomeState extends State<DemoHome> {
       qualityPreset: ShortsQuality.auto,
       showThumbnailsWhileBuffering: true,
       overlayBuilder: (ctx, index, st) {
+
+        if (!st.hasThumbnail && st.positionMs == 0 && st.durationMs == 0) {
+          return Center(
+            child: Container(
+              color: Colors.black,
+              child: const Text(
+                "Видео недоступно",
+                style: TextStyle(color: Colors.white),
+              ),
+            ),
+          );
+        }
+
         return Align(
           alignment: Alignment.bottomCenter,
           child: Container(

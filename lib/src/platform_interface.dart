@@ -59,6 +59,7 @@ abstract class ShortsPlatform extends PlatformInterface {
   Future<void> setProgressTracking({required bool enabled, int? intervalMs});
   void setMethodCallHandler(void Function(String method, Map args) handler);
   Future<void> primeSingle(int index);
+  Future<Map<String, dynamic>?> getPlaybackInfo(int index);
 
 
 }

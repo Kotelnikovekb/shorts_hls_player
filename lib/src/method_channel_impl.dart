@@ -146,4 +146,13 @@ class MethodChannelShorts extends ShortsPlatform {
   @override
   Future<void> primeSingle(int index) =>
       _ch.invokeMethod('prime', {'index': index});
+
+  @override
+  Future<Map<String, dynamic>?> getPlaybackInfo(int index) async {
+    final res = await _ch.invokeMethod<Map<dynamic, dynamic>>(
+      'getPlaybackInfo',
+      {'index': index},
+    );
+    return res?.map((k, v) => MapEntry(k.toString(), v));
+  }
 }
