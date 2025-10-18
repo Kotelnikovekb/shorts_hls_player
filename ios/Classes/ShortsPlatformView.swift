@@ -25,26 +25,18 @@ final class ShortsPlatformViewFactory: NSObject, FlutterPlatformViewFactory {
 
 final class ShortsPlatformView: NSObject, FlutterPlatformView {
   private let container = PlayerHostingView()
-  private var playerLayer: AVPlayerLayer?
 
   init(frame: CGRect, index: Int, pool: PlayerPool) {
     super.init()
     container.frame = frame
-
-    if let entry = pool.entry(for: index) {
-      let layer = AVPlayerLayer(player: entry.player)
-      layer.videoGravity = .resizeAspectFill
-      layer.frame = container.bounds
-      container.layer.addSublayer(layer)
-      self.playerLayer = layer
-    }
+    pool.bindView(index: index, view: container)
   }
 
   func view() -> UIView { container }
 }
 
 /// Простой UIView, который подгоняет слой при изменении размера
-private final class PlayerHostingView: UIView {
+final class PlayerHostingView: UIView {
   override func layoutSubviews() {
     super.layoutSubviews()
     layer.sublayers?.forEach { $0.frame = bounds }

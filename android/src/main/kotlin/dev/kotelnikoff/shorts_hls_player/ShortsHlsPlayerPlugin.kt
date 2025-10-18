@@ -3,6 +3,7 @@ package dev.kotelnikoff.shorts_hls_player
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import dev.kotelnikoff.shorts_hls_player.cache.CacheHolder
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
@@ -24,6 +25,7 @@ class ShortsHlsPlayerPlugin :
     private var pool: PlayerPool? = null
 
     private val textureSlots = mutableMapOf<Int, TextureSlot>()
+    private var poolConfig: PlayerPool.Config = PlayerPool.Config()
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         context = binding.applicationContext
@@ -51,18 +53,38 @@ class ShortsHlsPlayerPlugin :
     private fun emitBufferingStart(index: Int) = emit(mapOf("type" to "bufferingStart", "index" to index))
     private fun emitBufferingEnd(index: Int) = emit(mapOf("type" to "bufferingEnd", "index" to index))
     private fun emitWatched(index: Int, url: String) = emit(mapOf("type" to "watched", "index" to index, "url" to url))
+    private fun emitFirstFrame(index: Int) = emit(mapOf("type" to "firstFrame", "index" to index))
     private fun emitProgress(index: Int, url: String, pos: Long, dur: Long, buf: Long) =
         emit(mapOf("type" to "progress", "index" to index, "url" to url, "posMs" to pos, "durMs" to dur, "bufMs" to buf))
+    private fun emitMetrics(index: Int, metrics: PlayerPool.MetricsSnapshot) = emit(
+        mapOf(
+            "type" to "metrics",
+            "index" to index,
+            "startupMs" to metrics.startupMs.coerceToIntOrNull(),
+            "firstFrameMs" to metrics.firstFrameMs.coerceToIntOrNull(),
+            "rebufferCount" to metrics.rebufferCount,
+            "rebufferDurationMs" to metrics.rebufferDurationMs.coerceToInt(),
+            "lastRebufferDurationMs" to metrics.lastRebufferDurationMs.coerceToIntOrNull()
+        )
+    )
+
+    private fun Long.coerceToInt(): Int =
+        if (this > Int.MAX_VALUE.toLong()) Int.MAX_VALUE else this.toInt()
+
+    private fun Long?.coerceToIntOrNull(): Int? = this?.coerceToInt()
 
     /** ЕДИНСТВЕННЫЙ ensurePool() */
     private fun ensurePool() {
         if (pool != null) return
         pool = PlayerPool(
             context,
+            poolConfig,
             onWatched = { idx, url -> emitWatched(idx, url) },
             onProgress = { idx, url, pos, dur, buf -> emitProgress(idx, url, pos, dur, buf) },
             onReady = { idx -> emitReady(idx) },
-            onBuffering = { idx, isBuf -> if (isBuf) emitBufferingStart(idx) else emitBufferingEnd(idx) }
+            onBuffering = { idx, isBuf -> if (isBuf) emitBufferingStart(idx) else emitBufferingEnd(idx) },
+            onFirstFrame = { idx -> emitFirstFrame(idx) },
+            onMetrics = { idx, metrics -> emitMetrics(idx, metrics) }
         )
     }
 
@@ -71,6 +93,7 @@ class ShortsHlsPlayerPlugin :
         textureSlots.clear()
         pool?.release()
         pool = null
+        CacheHolder.release()
     }
 
     // ---- MethodChannel
@@ -82,10 +105,19 @@ class ShortsHlsPlayerPlugin :
     private fun handle(call: MethodCall, result: MethodChannel.Result) {
         when (call.method) {
             "init" -> {
-                ensurePool()
                 val looping = call.argument<Boolean>("looping") ?: false
                 val muted = call.argument<Boolean>("muted") ?: false
                 val volume = (call.argument<Number>("volume") ?: 1.0).toFloat()
+                val maxPlayers = call.argument<Number>("maxActivePlayers")?.toInt()?.coerceAtLeast(1)
+                val prefetchLimit = call.argument<Number>("prefetchBytesLimit")?.toLong()?.coerceAtLeast(0L)
+                val progressDefault = call.argument<Number>("progressIntervalMsDefault")?.toLong()?.coerceAtLeast(50L)
+                poolConfig = poolConfig.copy(
+                    maxActivePlayers = maxPlayers ?: poolConfig.maxActivePlayers,
+                    prefetchBytesLimit = prefetchLimit ?: poolConfig.prefetchBytesLimit,
+                    progressIntervalMsDefault = progressDefault ?: poolConfig.progressIntervalMsDefault
+                )
+                ensurePool()
+                pool?.applyConfig(poolConfig)
                 pool?.setLooping(looping)
                 pool?.setMuted(muted)
                 pool?.setVolume(volume)
@@ -103,7 +135,12 @@ class ShortsHlsPlayerPlugin :
             "appendUrls" -> {
                 ensurePool()
                 val urls = call.argument<List<String>>("urls") ?: emptyList()
-                urls.forEachIndexed { i, u -> pool?.setUrl(i, u) }
+                val replace = call.argument<Boolean>("replace") ?: false
+                if (replace) {
+                    pool?.replaceUrls(urls)
+                } else {
+                    urls.forEach { u -> pool?.appendUrl(u) }
+                }
                 result.success(null)
             }
 
@@ -143,8 +180,26 @@ class ShortsHlsPlayerPlugin :
                 result.success(null)
             }
 
-            "play" -> { ensurePool(); pool?.play(); result.success(null) }
-            "pause" -> { ensurePool(); pool?.pause(); result.success(null) }
+            "play" -> {
+                ensurePool()
+                val index = (call.argument<Number>("index") ?: -1).toInt()
+                if (index >= 0) {
+                    pool?.play(index)
+                } else {
+                    pool?.play()
+                }
+                result.success(null)
+            }
+            "pause" -> {
+                ensurePool()
+                val index = (call.argument<Number>("index") ?: -1).toInt()
+                if (index >= 0) {
+                    pool?.pause(index)
+                } else {
+                    pool?.pause()
+                }
+                result.success(null)
+            }
             "togglePlayPause" -> { ensurePool(); pool?.togglePlayPause(); result.success(null) }
             "isPaused" -> { ensurePool(); result.success(pool?.isPaused() ?: true) }
 
@@ -174,7 +229,20 @@ class ShortsHlsPlayerPlugin :
                 result.success(null)
             }
 
-            "getThumbnail" -> { result.success(null) }
+            "getThumbnail" -> {
+                ensurePool()
+                val index = (call.argument<Number>("index") ?: -1).toInt()
+                if (index < 0) {
+                    result.error("INVALID_INDEX", "Index must be >= 0", null)
+                    return
+                }
+                val poolRef = pool
+                if (poolRef == null) {
+                    result.success(null)
+                    return
+                }
+                poolRef.getThumbnail(index) { data -> result.success(data) }
+            }
 
             "disposeIndex" -> {
                 val index = (call.argument<Number>("index") ?: -1).toInt()

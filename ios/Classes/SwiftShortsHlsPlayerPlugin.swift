@@ -56,6 +56,11 @@ public class SwiftShortsHlsPlayerPlugin: NSObject, FlutterPlugin, FlutterStreamH
         if let looping = args["looping"] as? Bool { pool.setLooping(looping) }
         if let muted = args["muted"] as? Bool { pool.setMuted(muted) }
         if let volume = args["volume"] as? Double { pool.setVolume(Float(volume)) }
+        if let buffer = args["forwardBufferSeconds"] as? Double {
+          pool.setForwardBuffer(seconds: buffer)
+        } else if let bufferInt = args["forwardBufferSeconds"] as? Int {
+          pool.setForwardBuffer(seconds: Double(bufferInt))
+        }
         if let progress = args["progressTracking"] as? [String: Any] {
           let enabled = progress["enabled"] as? Bool ?? false
           let interval = progress["intervalMs"] as? Int
@@ -69,7 +74,11 @@ public class SwiftShortsHlsPlayerPlugin: NSObject, FlutterPlugin, FlutterStreamH
     case "appendUrls":
       if let args = call.arguments as? [String: Any],
          let urls = args["urls"] as? [String] {
-        pool.append(urls: urls)
+        if let replace = args["replace"] as? Bool, replace {
+          pool.replace(urls: urls)
+        } else {
+          pool.append(urls: urls)
+        }
       }
       result(nil)
 

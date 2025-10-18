@@ -7,7 +7,6 @@ class MethodChannelShorts extends ShortsPlatform {
   static const _ch = MethodChannel('shorts_hls_player/methods');
   static const _ev = EventChannel('shorts_hls_player/events');
   Stream<ShortsEvent>? _cached;
-  void Function(String, Map)? _mh;
 
   @override
   Future<void> init(
@@ -16,8 +15,8 @@ class MethodChannelShorts extends ShortsPlatform {
   }
 
   @override
-  Future<void> append(List<String> urls) =>
-      _ch.invokeMethod('appendUrls', {'urls': urls});
+  Future<void> append(List<String> urls, {bool replace = false}) =>
+      _ch.invokeMethod('appendUrls', {'urls': urls, 'replace': replace});
 
   @override
   Future<void> disposeIndex(int index) =>
@@ -89,9 +88,24 @@ class MethodChannelShorts extends ShortsPlatform {
           return OnStall(idx);
         case 'error':
           return OnError(idx, (m['message'] as String?) ?? 'error');
+        case 'firstFrame':
+          return FirstFrameEvent(idx);
         case 'progress':
-          return OnProgress(idx, (m['posMs'] as num?)?.toInt() ?? 0,
-              (m['durMs'] as num?)?.toInt());
+          return OnProgress(
+            idx,
+            (m['posMs'] as num?)?.toInt() ?? 0,
+            (m['durMs'] as num?)?.toInt(),
+            (m['bufMs'] as num?)?.toInt(),
+          );
+        case 'metrics':
+          return MetricsEvent(
+            idx,
+            startupMs: (m['startupMs'] as num?)?.toInt(),
+            firstFrameMs: (m['firstFrameMs'] as num?)?.toInt(),
+            rebufferCount: (m['rebufferCount'] as num?)?.toInt() ?? 0,
+            rebufferDurationMs: (m['rebufferDurationMs'] as num?)?.toInt() ?? 0,
+            lastRebufferDurationMs: (m['lastRebufferDurationMs'] as num?)?.toInt(),
+          );
         default:
           return OnError(idx, 'unknown_event');
       }
@@ -108,7 +122,6 @@ class MethodChannelShorts extends ShortsPlatform {
 
   @override
   void setMethodCallHandler(void Function(String, Map args) handler) {
-    _mh = handler;
     _ch.setMethodCallHandler((call) async {
       final args =
           (call.arguments as Map?)?.cast<String, Object?>() ?? const {};

@@ -1,29 +1,9 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:shorts_hls_player/shorts_hls_player.dart';
-import 'package:shorts_hls_player/shorts_hls_player_platform_interface.dart';
-import 'package:shorts_hls_player/shorts_hls_player_method_channel.dart';
-import 'package:plugin_platform_interface/plugin_platform_interface.dart';
-
-class MockShortsHlsPlayerPlatform
-    with MockPlatformInterfaceMixin
-    implements ShortsHlsPlayerPlatform {
-
-  @override
-  Future<String?> getPlatformVersion() => Future.value('42');
-}
+import 'package:shorts_hls_player/src/method_channel_impl.dart';
+import 'package:shorts_hls_player/src/platform_interface.dart';
 
 void main() {
-  final ShortsHlsPlayerPlatform initialPlatform = ShortsHlsPlayerPlatform.instance;
-
-  test('$MethodChannelShortsHlsPlayer is the default instance', () {
-    expect(initialPlatform, isInstanceOf<MethodChannelShortsHlsPlayer>());
-  });
-
-  test('getPlatformVersion', () async {
-    ShortsHlsPlayer shortsHlsPlayerPlugin = ShortsHlsPlayer();
-    MockShortsHlsPlayerPlatform fakePlatform = MockShortsHlsPlayerPlatform();
-    ShortsHlsPlayerPlatform.instance = fakePlatform;
-
-    expect(await shortsHlsPlayerPlugin.getPlatformVersion(), '42');
+  test('ShortsPlatform default instance uses method channel', () {
+    expect(ShortsPlatform.instance, isA<MethodChannelShorts>());
   });
 }

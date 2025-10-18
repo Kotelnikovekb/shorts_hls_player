@@ -19,7 +19,7 @@ abstract class ShortsPlatform extends PlatformInterface {
   // core
   Future<void> init({ShortsInitConfig config = const ShortsInitConfig()});
 
-  Future<void> append(List<String> urls);
+  Future<void> append(List<String> urls, {bool replace = false});
 
   Future<void> disposeIndex(int index);
 

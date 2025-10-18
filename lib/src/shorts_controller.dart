@@ -1,11 +1,8 @@
-import 'dart:typed_data';
-
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import '../shorts_hls_player.dart';
 import 'platform_interface.dart';
-import 'types.dart';
 import 'dart:async';
 
 class ShortsController with ChangeNotifier {
@@ -23,10 +20,17 @@ class ShortsController with ChangeNotifier {
             error: null,
             positionMs: 0,
             durationMs: 0,
+            bufferedMs: 0,
             scrollSpeedPxPerMs: 0,
             direction: 0,
             thumbnailLoading: false,
             hasThumbnail: false,
+            firstFrameRendered: false,
+            startupMs: -1,
+            firstFrameMs: -1,
+            rebufferCount: 0,
+            rebufferDurationMs: 0,
+            lastRebufferDurationMs: 0,
           );
 
   bool _isPaused = true;
@@ -51,6 +55,9 @@ class ShortsController with ChangeNotifier {
   ShortsQuality qualityPreset = ShortsQuality.auto;
   bool progressEnabled = false;
   Duration progressInterval = const Duration(milliseconds: 500);
+  int? maxActivePlayers;
+  int? prefetchBytesLimit;
+  Duration? forwardBufferDuration;
   bool _initialized = false;
 
   Stream<ShortsEvent> get events => _eventsCtrl.stream;
@@ -59,17 +66,7 @@ class ShortsController with ChangeNotifier {
     if (_initialized) return;
 
     _p.events().listen(_eventsCtrl.add);
-
-    _p.setMethodCallHandler((method, args) {
-      switch (method) {
-        case 'onWatched':
-          // здесь можешь дергать свой Stream/Callback
-          break;
-        case 'onProgress':
-          // тут можно пробрасывать свой ProgressEvent
-          break;
-      }
-    });
+    _attachMethodHandlerIfNeeded();
 
     // единый «толстый» init с конфигом
     await _p.init(
@@ -80,6 +77,9 @@ class ShortsController with ChangeNotifier {
         quality: qualityPreset,
         progressEnabled: progressEnabled,
         progressInterval: progressInterval,
+        maxActivePlayers: maxActivePlayers,
+        prefetchBytesLimit: prefetchBytesLimit,
+        forwardBufferDuration: forwardBufferDuration,
       ),
     );
 
@@ -95,7 +95,47 @@ class ShortsController with ChangeNotifier {
     notifyListeners();
   }
 
-
+  ShortsEvent _normalizeEvent(ShortsEvent event) {
+    if (event is ReadyEvent ||
+        event is BufferingStartEvent ||
+        event is BufferingEndEvent ||
+        event is FirstFrameEvent ||
+        event is ProgressEvent ||
+        event is MetricsEvent ||
+        event is CompletedEvent ||
+        event is ErrorEvent ||
+        event is UnknownEvent) {
+      return event;
+    }
+    if (event is OnReady) {
+      return ReadyEvent(event.index);
+    }
+    if (event is OnBufferingStart) {
+      return BufferingStartEvent(event.index);
+    }
+    if (event is OnBufferingEnd) {
+      return BufferingEndEvent(event.index);
+    }
+    if (event is OnError) {
+      return ErrorEvent(event.index, event.message);
+    }
+    if (event is OnProgress) {
+      final posMs = event.posMs < 0 ? 0 : event.posMs;
+      final durMs = event.durMs ?? -1;
+      final duration =
+          durMs > 0 ? Duration(milliseconds: durMs) : Duration.zero;
+      return ProgressEvent(
+        event.index,
+        Duration(milliseconds: posMs),
+        duration,
+        bufferedMs: event.bufferedMs,
+      );
+    }
+    if (event is MetricsEvent) {
+      return event;
+    }
+    return event;
+  }
 
   Future<void> _waitReadyFor(
     int index, {
@@ -166,7 +206,7 @@ class ShortsController with ChangeNotifier {
   Future<Uint8List?> getThumbnail(int index) => _p.getThumbnail(index);
 
   Future<void> append(List<Uri> urls) =>
-      _p.append(urls.map((e) => e.toString()).toList());
+      _p.append(urls.map((e) => e.toString()).toList(), replace: false);
 
 /*  Future<void> prewarmAround(
     int index, {
@@ -188,9 +228,10 @@ class ShortsController with ChangeNotifier {
     int backward = 1,
   }) async {
     // helper: безопасно вызвать prime, игнорируя невалидные индексы/ошибки
-    Future<void> _safePrime(int i) async {
-      if (i < 0)
+    Future<void> safePrime(int i) async {
+      if (i < 0) {
         return; // НЕ шлём отрицательные индексы -> не ловим INVALID_INDEX
+      }
       try {
         await _p.prime(i); // твой method_channel_impl.dart занимается нативом
       } on PlatformException {
@@ -201,18 +242,18 @@ class ShortsController with ChangeNotifier {
     }
 
     // текущий
-    await _safePrime(index);
+    await safePrime(index);
 
     // вперёд
     final futures = <Future<void>>[];
     for (int i = 1; i <= forward; i++) {
-      futures.add(_safePrime(index + i));
+      futures.add(safePrime(index + i));
     }
     // назад
     for (int i = 1; i <= backward; i++) {
       final prev = index - i;
       if (prev < 0) break; // дальше только отрицательные — сразу выходим
-      futures.add(_safePrime(prev));
+      futures.add(safePrime(prev));
     }
 
     await Future.wait(futures);
@@ -280,27 +321,46 @@ class ShortsController with ChangeNotifier {
 
   bool _methodHandlerAttached = false;
 
+  @override
+  void dispose() {
+    _evSub?.cancel();
+    _evSub = null;
+    _eventsCtrl.close();
+    super.dispose();
+  }
+
   void _attachMethodHandlerIfNeeded() {
     if (_methodHandlerAttached) return;
     _p.setMethodCallHandler((method, args) {
       switch (method) {
         case 'onWatched':
           final index = (args['index'] as num?)?.toInt() ?? -1;
-          final url = args['url'] as String?;
-          if (index >= 0 && url != null) {
-            // можно дернуть свой notifier/stream
-            // print('onWatched $index $url');
+          if (index >= 0) {
+            _eventsCtrl.add(CompletedEvent(index));
+            _setOverlay(index, (st) => st.copyWith(positionMs: st.durationMs));
           }
           break;
         case 'onProgress':
           final index = (args['index'] as num?)?.toInt() ?? -1;
-          final url = args['url'] as String?;
           final pos = (args['positionMs'] as num?)?.toInt() ?? -1;
           final dur = (args['durationMs'] as num?)?.toInt() ?? -1;
-          final buf = (args['bufferedMs'] as num?)?.toInt() ?? -1;
-          if (index >= 0 && url != null && pos >= 0) {
-            // тут можно пробрасывать наружу свой Stream<ProgressEvent>
-            // print('onProgress $index $pos/$dur (+$buf)');
+          final buf = (args['bufferedMs'] as num?)?.toInt();
+          if (index >= 0 && pos >= 0) {
+            _eventsCtrl.add(
+              ProgressEvent(
+                index,
+                Duration(milliseconds: pos),
+                dur >= 0 ? Duration(milliseconds: dur) : Duration.zero,
+                bufferedMs: buf,
+              ),
+            );
+            _setOverlay(index, (st) => st.copyWith(
+              positionMs: pos,
+              durationMs: dur >= 0 ? dur : st.durationMs,
+              bufferedMs: buf ?? st.bufferedMs,
+              buffering: false,
+              firstFrameRendered: st.firstFrameRendered || pos > 0,
+            ));
           }
           break;
       }
@@ -311,30 +371,41 @@ class ShortsController with ChangeNotifier {
   void _wireEvents() {
     if (_evSub != null) return;
     _evSub = _p.events().listen((e) {
-      if (e is ReadyEvent) {
-        _setOverlay(e.index, (st) => st.copyWith(error: null));
-        final list = _pendingReady.remove(e.index);
+      final event = _normalizeEvent(e);
+      if (event is ReadyEvent) {
+        _setOverlay(event.index, (st) => st.copyWith(error: null));
+        final list = _pendingReady.remove(event.index);
         if (list != null) {
           for (final c in list) {
             if (!c.isCompleted) c.complete();
           }
         }
-      } else if (e is BufferingStartEvent) {
-        _setOverlay(e.index, (st) => st.copyWith(buffering: true));
-      } else if (e is BufferingEndEvent) {
-        _setOverlay(e.index, (st) => st.copyWith(buffering: false));
-      } else if (e is ProgressEvent) {
-        _setOverlay(e.index, (st) => st.copyWith(
-          positionMs: e.position.inMilliseconds,
-          durationMs: e.duration.inMilliseconds > 0 ? e.duration.inMilliseconds : st.durationMs,
+      } else if (event is BufferingStartEvent) {
+        _setOverlay(event.index, (st) => st.copyWith(buffering: true));
+      } else if (event is BufferingEndEvent) {
+        _setOverlay(event.index, (st) => st.copyWith(buffering: false));
+      } else if (event is ProgressEvent) {
+        _setOverlay(event.index, (st) => st.copyWith(
+          positionMs: event.position.inMilliseconds,
+          durationMs: event.duration.inMilliseconds > 0 ? event.duration.inMilliseconds : st.durationMs,
+          bufferedMs: event.bufferedMs ?? st.bufferedMs,
           buffering: false,
+          firstFrameRendered: st.firstFrameRendered || event.position > Duration.zero,
         ));
-      } else if (e is CompletedEvent) {
-        _setOverlay(e.index, (st) => st.copyWith(positionMs: st.durationMs));
-      } else if (e is ErrorEvent) {
-        _setOverlay(e.index, (st) => st.copyWith(error: e.message, buffering: false));
-      } else if (e is FirstFrameEvent) {
-        _setOverlay(e.index, (st) => st.copyWith(buffering: false));
+      } else if (event is CompletedEvent) {
+        _setOverlay(event.index, (st) => st.copyWith(positionMs: st.durationMs));
+      } else if (event is ErrorEvent) {
+        _setOverlay(event.index, (st) => st.copyWith(error: event.message, buffering: false));
+      } else if (event is MetricsEvent) {
+        _setOverlay(event.index, (st) => st.copyWith(
+          startupMs: event.startupMs ?? st.startupMs,
+          firstFrameMs: event.firstFrameMs ?? st.firstFrameMs,
+          rebufferCount: event.rebufferCount,
+          rebufferDurationMs: event.rebufferDurationMs,
+          lastRebufferDurationMs: event.lastRebufferDurationMs ?? st.lastRebufferDurationMs,
+        ));
+      } else if (event is FirstFrameEvent) {
+        _setOverlay(event.index, (st) => st.copyWith(buffering: false, firstFrameRendered: true));
       }
     });
   }

@@ -21,6 +21,7 @@ final class PlayerItemHost {
   var onProgress: ((Int, Int, Int?) -> Void)? // index, posMs, durMs
   var onError: ((Int, String) -> Void)?
   var onCompleted: ((Int) -> Void)?
+  var onFirstFrame: ((Int) -> Void)?
     var progressInterval: Int = 500 { // ms
       didSet {
         if let timeObs = timeObs {
@@ -30,6 +31,9 @@ final class PlayerItemHost {
         attachProgressObserver()
       }
     }
+  var forwardBufferDuration: TimeInterval? {
+    didSet { applyForwardBufferDuration() }
+  }
 
   // observers
   private var kvo: [NSKeyValueObservation] = []
@@ -38,6 +42,7 @@ final class PlayerItemHost {
 
   private(set) var prepared = false
   private var quality: QualityPreset = .auto
+  private var firstFrameReported = false
 
   init(index: Int, url: URL) {
     self.index = index
@@ -47,6 +52,7 @@ final class PlayerItemHost {
     self.player = AVPlayer(playerItem: item)
     self.player.automaticallyWaitsToMinimizeStalling = true
     attachObservers()
+    applyForwardBufferDuration()
   }
 
   deinit {
@@ -61,6 +67,7 @@ final class PlayerItemHost {
       prepared = true
       onReady?(index)
     }
+    firstFrameReported = false
     // иначе дождёмся KVO status == .readyToPlay
   }
 
@@ -114,7 +121,7 @@ final class PlayerItemHost {
   }
 
     // PlayerItemHost.swift
-    func getVariants() -> [[String: Any]] {
+  func getVariants() -> [[String: Any]] {
       var out: [[String: Any]] = []
       if #available(iOS 15.0, *) {
         for v in asset.variants {
@@ -208,7 +215,15 @@ final class PlayerItemHost {
           // progress
           attachProgressObserver()
 
-    kvo = [obsStatus, obsEmpty, obsKeepUp]
+    let obsTimeControl = player.observe(\.timeControlStatus, options: [.new]) { [weak self] pl, _ in
+      guard let self = self else { return }
+      if !self.firstFrameReported && pl.timeControlStatus == .playing {
+        self.firstFrameReported = true
+        self.onFirstFrame?(self.index)
+      }
+    }
+
+    kvo = [obsStatus, obsEmpty, obsKeepUp, obsTimeControl]
     notifTokens = [tokStall]
   }
 
@@ -243,5 +258,13 @@ final class PlayerItemHost {
       return CMTimeGetSeconds(t)
     }
     return nil
+  }
+
+  private func applyForwardBufferDuration() {
+    if let seconds = forwardBufferDuration {
+      item.preferredForwardBufferDuration = seconds
+    } else {
+      item.preferredForwardBufferDuration = 0
+    }
   }
 }

@@ -1,6 +1,13 @@
 import AVFoundation
 import UIKit
 
+private final class WeakPlayerView {
+  weak var view: PlayerHostingView?
+  init(_ view: PlayerHostingView) {
+    self.view = view
+  }
+}
+
 final class PlayerPool {
 
   struct Entry {
@@ -8,12 +15,15 @@ final class PlayerPool {
     let host: PlayerItemHost
     var player: AVPlayer { host.player }
     var item: AVPlayerItem { host.item }
+    var layer: AVPlayerLayer?
   }
 
   private var entries: [Int: Entry] = [:]
   private var urls: [URL] = []
   private var currentIndex: Int = -1
   var onEvent: (([String: Any]) -> Void)?
+  private var forwardBufferSeconds: TimeInterval?
+  private var boundViews: [Int: WeakPlayerView] = [:]
     
     private var isLooping = false
     private var isMuted = false
@@ -73,6 +83,16 @@ final class PlayerPool {
     self.urls.append(contentsOf: urls.compactMap { URL(string: $0) })
   }
 
+  func replace(urls: [String]) {
+    self.urls = urls.compactMap { URL(string: $0) }
+    entries.removeAll()
+    currentIndex = -1
+    watchedFired.removeAll()
+    for view in boundViews.values {
+      view.view?.layer.sublayers?.forEach { $0.removeFromSuperlayer() }
+    }
+  }
+
   func entry(for index: Int) -> Entry? { entries[index] }
 
 
@@ -82,6 +102,7 @@ final class PlayerPool {
 
       let url = urls[index]
       let host = PlayerItemHost(index: index, url: url)
+      host.forwardBufferDuration = forwardBufferSeconds
 
       // apply global flags
       host.player.isMuted = isMuted
@@ -96,6 +117,7 @@ final class PlayerPool {
       host.onBufferingEnd = { [weak self] i in self?.send(["type":"bufferingEnd","index": i]) }
       host.onStall = { [weak self] i in self?.send(["type":"stall","index": i]) }
       host.onError = { [weak self] i, msg in self?.send(["type":"error","index": i, "message": msg]) }
+      host.onFirstFrame = { [weak self] i in self?.send(["type":"firstFrame","index": i]) }
 
       host.onProgress = { [weak self] idx, posMs, durMs in
         guard let self = self else { return }
@@ -129,14 +151,33 @@ final class PlayerPool {
         e.player.play()
       }
 
-      let entry = Entry(url: url, host: host)
-      entries[index] = entry
-      host.prime()
+    let entry = Entry(url: url, host: host)
+    entries[index] = entry
+    if let view = boundViews[index]?.view {
+      let layer = AVPlayerLayer(player: host.player)
+      layer.videoGravity = .resizeAspectFill
+      layer.frame = view.bounds
+      view.layer.sublayers?.forEach { $0.removeFromSuperlayer() }
+      view.layer.addSublayer(layer)
+      storeLayer(layer, for: index)
     }
+    host.prime()
+    attachViewIfPossible(index: index)
+  }
 
   func dispose(index: Int) {
+    if let view = boundViews[index]?.view {
+      view.layer.sublayers?.forEach { $0.removeFromSuperlayer() }
+    }
     entries.removeValue(forKey: index) // deinit host освободит ресурсы
+    boundViews.removeValue(forKey: index)
   }
+    
+    func setForwardBuffer(seconds: TimeInterval?) {
+      let sanitized = seconds.map { max(0.0, $0) }
+      forwardBufferSeconds = sanitized
+      entries.values.forEach { $0.host.forwardBufferDuration = sanitized }
+    }
     
     func togglePlayPause(index: Int) {
       guard let p = entries[index]?.player else { return }
@@ -169,6 +210,7 @@ final class PlayerPool {
       dispose(index: key)
     }
     send(["type":"ready","index": index])
+    attachViewIfPossible(index: index)
   }
     func setProgressTracking(enabled: Bool, intervalMs: Int?) {
       progressEnabled = enabled
@@ -180,6 +222,40 @@ final class PlayerPool {
 
   func play(index: Int) { entries[index]?.player.play() }
   func pause(index: Int) { entries[index]?.player.pause() }
+  
+  func bindView(index: Int, view: PlayerHostingView) {
+    boundViews[index] = WeakPlayerView(view)
+    attachViewIfPossible(index: index)
+  }
+
+  private func attachViewIfPossible(index: Int) {
+    guard let view = boundViews[index]?.view else { return }
+    guard let player = entries[index]?.player else { return }
+
+    let layer: AVPlayerLayer
+    if let existing = entries[index]?.layer {
+      layer = existing
+      layer.player = player
+    } else {
+      layer = AVPlayerLayer(player: player)
+      layer.videoGravity = .resizeAspectFill
+      storeLayer(layer, for: index)
+    }
+
+    layer.frame = view.bounds
+    view.layer.sublayers?.forEach { $0.removeFromSuperlayer() }
+    view.layer.addSublayer(layer)
+  }
+
+  private func updateEntry(_ index: Int, mutate: (inout Entry) -> Void) {
+    guard var entry = entries[index] else { return }
+    mutate(&entry)
+    entries[index] = entry
+  }
+
+  private func storeLayer(_ layer: AVPlayerLayer, for index: Int) {
+    updateEntry(index) { $0.layer = layer }
+  }
 
   func setQuality(preset: String) {
     guard let qp = QualityPreset(rawValue: preset) else { return }

@@ -1,3 +1,5 @@
+package android
+
 group = "dev.kotelnikoff.shorts_hls_player"
 version = "1.0-SNAPSHOT"
 
@@ -65,10 +67,11 @@ android {
     }
 }
 dependencies {
-    implementation "androidx.media3:media3-exoplayer:1.8.0"
-    implementation "androidx.media3:media3-exoplayer-hls:1.8.0"
-    implementation "androidx.media3:media3-ui:1.8.0"
+    def media3_version = "1.5.1"
+    implementation "androidx.media3:media3-exoplayer:$media3_version"
+    implementation "androidx.media3:media3-exoplayer-hls:$media3_version"
+    implementation "androidx.media3:media3-ui:$media3_version"
     implementation "androidx.lifecycle:lifecycle-runtime-ktx:2.8.5"
-    implementation "androidx.media3:media3-datasource:1.8.0"
-    implementation "androidx.media3:media3-datasource-okhttp:1.8.0"
+    implementation "androidx.media3:media3-datasource:$media3_version"
+    implementation "androidx.media3:media3-datasource-okhttp:$media3_version"
 }

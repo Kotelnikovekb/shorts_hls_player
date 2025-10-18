@@ -20,6 +20,9 @@ class ShortsInitConfig {
   final ShortsQuality? quality;
   final bool progressEnabled;
   final Duration? progressInterval;
+  final int? maxActivePlayers;
+  final int? prefetchBytesLimit;
+  final Duration? forwardBufferDuration;
 
   const ShortsInitConfig({
     this.looping = false,
@@ -28,6 +31,9 @@ class ShortsInitConfig {
     this.quality,
     this.progressEnabled = false,
     this.progressInterval,
+    this.maxActivePlayers,
+    this.prefetchBytesLimit,
+    this.forwardBufferDuration,
   });
 
   Map<String, Object?> toMap() => {
@@ -39,7 +45,13 @@ class ShortsInitConfig {
           'enabled': progressEnabled,
           if (progressInterval != null)
             'intervalMs': progressInterval!.inMilliseconds,
-        }
+        },
+        if (maxActivePlayers != null) 'maxActivePlayers': maxActivePlayers,
+        if (prefetchBytesLimit != null)
+          'prefetchBytesLimit': prefetchBytesLimit,
+        if (forwardBufferDuration != null)
+          'forwardBufferSeconds':
+              forwardBufferDuration!.inMilliseconds / 1000.0,
       };
 }
 
@@ -111,8 +123,9 @@ class OnProgress extends ShortsEvent {
   final int index;
   final int posMs;
   final int? durMs;
+  final int? bufferedMs;
 
-  const OnProgress(this.index, this.posMs, this.durMs);
+  const OnProgress(this.index, this.posMs, this.durMs, this.bufferedMs);
 }
 
 // ↓ Добавляем конкретные типы событий:
@@ -140,7 +153,25 @@ class ProgressEvent extends ShortsEvent {
   final int index;
   final Duration position;
   final Duration duration;
-  const ProgressEvent(this.index, this.position, this.duration);
+  final int? bufferedMs;
+  const ProgressEvent(this.index, this.position, this.duration, {this.bufferedMs});
+}
+
+class MetricsEvent extends ShortsEvent {
+  final int index;
+  final int? startupMs;
+  final int? firstFrameMs;
+  final int rebufferCount;
+  final int rebufferDurationMs;
+  final int? lastRebufferDurationMs;
+  const MetricsEvent(
+    this.index, {
+    this.startupMs,
+    this.firstFrameMs,
+    this.rebufferCount = 0,
+    this.rebufferDurationMs = 0,
+    this.lastRebufferDurationMs,
+  });
 }
 
 class CompletedEvent extends ShortsEvent {
@@ -177,7 +208,22 @@ ShortsEvent parseShortsEvent(Map<dynamic, dynamic> map) {
     case 'progress':
       final pos = (map['posMs'] ?? map['position'] ?? 0) as int;
       final dur = (map['durMs'] ?? map['duration'] ?? -1) as int;
-      return ProgressEvent(idx, Duration(milliseconds: pos), Duration(milliseconds: dur));
+      final buf = (map['bufMs'] ?? map['bufferedMs']) as int?;
+      return ProgressEvent(
+        idx,
+        Duration(milliseconds: pos),
+        Duration(milliseconds: dur),
+        bufferedMs: buf,
+      );
+    case 'metrics':
+      return MetricsEvent(
+        idx,
+        startupMs: (map['startupMs'] as num?)?.toInt(),
+        firstFrameMs: (map['firstFrameMs'] as num?)?.toInt(),
+        rebufferCount: (map['rebufferCount'] as num?)?.toInt() ?? 0,
+        rebufferDurationMs: (map['rebufferDurationMs'] as num?)?.toInt() ?? 0,
+        lastRebufferDurationMs: (map['lastRebufferDurationMs'] as num?)?.toInt(),
+      );
     case 'completed':
     case 'watched': // если с нативной стороны шлёшь watched
       return CompletedEvent(idx);

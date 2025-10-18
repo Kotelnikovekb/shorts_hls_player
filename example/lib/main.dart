@@ -27,9 +27,7 @@ class DemoHome extends StatefulWidget {
 }
 
 class _DemoHomeState extends State<DemoHome> {
-  final _ctrl = ShortsController(
-
-  )..setLooping(true)..setProgressTracking(enabled: true);
+  final _ctrl = ShortsController();
   List<Uri> _seed = [];          // исходный набор ссылок
   List<Uri> _urls = [];          // текущий увеличиваемый список
   String? _error;
@@ -62,6 +60,8 @@ class _DemoHomeState extends State<DemoHome> {
 
       _seed = List<Uri>.from(list);
       _urls = List<Uri>.from(list); // стартуем с исходного набора
+      await _ctrl.setLooping(true);
+      await _ctrl.setProgressTracking(enabled: true);
 
       setState(() {
         _error = null;
