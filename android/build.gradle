@@ -1,5 +1,3 @@
-package android
-
 group = "dev.kotelnikoff.shorts_hls_player"
 version = "1.0-SNAPSHOT"
 

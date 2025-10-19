@@ -88,6 +88,7 @@ sealed class ShortsEvent {
   const ShortsEvent();
 }
 
+// Legacy event types for backward compatibility
 class OnReady extends ShortsEvent {
   final int index;
 
@@ -128,7 +129,7 @@ class OnProgress extends ShortsEvent {
   const OnProgress(this.index, this.posMs, this.durMs, this.bufferedMs);
 }
 
-// ↓ Добавляем конкретные типы событий:
+// Modern event types
 class ReadyEvent extends ShortsEvent {
   final int index;
   const ReadyEvent(this.index);
@@ -190,9 +191,7 @@ class UnknownEvent extends ShortsEvent {
   const UnknownEvent(this.raw);
 }
 
-// Универсальный парсер из map (что прилетает из EventChannel):
 ShortsEvent parseShortsEvent(Map<dynamic, dynamic> map) {
-  // поддержим оба ключа: "type" и "event"
   final type = (map['type'] ?? map['event']) as String? ?? 'unknown';
   final idx = (map['index'] as num?)?.toInt() ?? -1;
 
@@ -225,7 +224,7 @@ ShortsEvent parseShortsEvent(Map<dynamic, dynamic> map) {
         lastRebufferDurationMs: (map['lastRebufferDurationMs'] as num?)?.toInt(),
       );
     case 'completed':
-    case 'watched': // если с нативной стороны шлёшь watched
+    case 'watched':
       return CompletedEvent(idx);
     case 'error':
       return ErrorEvent(idx, map['message']?.toString() ?? 'unknown');
