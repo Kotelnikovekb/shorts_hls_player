@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:collection';
 import 'dart:math';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import '../shorts_hls_player.dart';
 
@@ -55,6 +56,7 @@ class FeedOverlayState {
   final double scrollSpeedPxPerMs;
   final int direction; // -1 вверх, +1 вниз, 0
   final bool thumbnailLoading;
+  final bool thumbnailError;
   final bool hasThumbnail;
   final bool firstFrameRendered;
   final int startupMs;
@@ -62,6 +64,8 @@ class FeedOverlayState {
   final int rebufferCount;
   final int rebufferDurationMs;
   final int lastRebufferDurationMs;
+  final bool showingPreview;
+  final int previewRemainingMs;
 
   String get positionLabel {
     final d = Duration(milliseconds: positionMs);
@@ -83,6 +87,7 @@ class FeedOverlayState {
     required this.scrollSpeedPxPerMs,
     required this.direction,
     required this.thumbnailLoading,
+    required this.thumbnailError,
     required this.hasThumbnail,
     required this.firstFrameRendered,
     required this.startupMs,
@@ -90,6 +95,8 @@ class FeedOverlayState {
     required this.rebufferCount,
     required this.rebufferDurationMs,
     required this.lastRebufferDurationMs,
+    required this.showingPreview,
+    required this.previewRemainingMs,
   });
 
 
@@ -102,6 +109,7 @@ class FeedOverlayState {
     double? scrollSpeedPxPerMs,
     int? direction,
     bool? thumbnailLoading,
+    bool? thumbnailError,
     bool? hasThumbnail,
     bool? firstFrameRendered,
     int? startupMs,
@@ -109,6 +117,8 @@ class FeedOverlayState {
     int? rebufferCount,
     int? rebufferDurationMs,
     int? lastRebufferDurationMs,
+    bool? showingPreview,
+    int? previewRemainingMs,
   }) {
     return FeedOverlayState(
       buffering: buffering ?? this.buffering,
@@ -119,6 +129,7 @@ class FeedOverlayState {
       scrollSpeedPxPerMs: scrollSpeedPxPerMs ?? this.scrollSpeedPxPerMs,
       direction: direction ?? this.direction,
       thumbnailLoading: thumbnailLoading ?? this.thumbnailLoading,
+      thumbnailError: thumbnailError ?? this.thumbnailError,
       hasThumbnail: hasThumbnail ?? this.hasThumbnail,
       firstFrameRendered: firstFrameRendered ?? this.firstFrameRendered,
       startupMs: startupMs ?? this.startupMs,
@@ -126,6 +137,8 @@ class FeedOverlayState {
       rebufferCount: rebufferCount ?? this.rebufferCount,
       rebufferDurationMs: rebufferDurationMs ?? this.rebufferDurationMs,
       lastRebufferDurationMs: lastRebufferDurationMs ?? this.lastRebufferDurationMs,
+      showingPreview: showingPreview ?? this.showingPreview,
+      previewRemainingMs: previewRemainingMs ?? this.previewRemainingMs,
     );
   }
 }
@@ -162,13 +175,14 @@ class ShortsFeed extends StatefulWidget {
   final int? maxActivePlayers;
   final int? prefetchBytesLimit;
   final Duration? forwardBufferDuration;
+  final ImageProvider? Function(int index)? previewImageBuilder;
 
   const ShortsFeed({
     super.key,
     required this.urls,
     this.controller,
-    this.preloadWindow = const PreloadWindow(),
-    this.scrollPrewarm = const ScrollPrewarm(),
+    this.preloadWindow = const PreloadWindow(fwd: 2, back: 1),
+    this.scrollPrewarm = const ScrollPrewarm(triggerDelta: 0.1, fastSwipeSpeed: 2.0, extraOnFast: 1),
     this.qualityPreset = ShortsQuality.auto,
     this.showThumbnailsWhileBuffering = true,
     this.overlayBuilder,
@@ -178,10 +192,11 @@ class ShortsFeed extends StatefulWidget {
     this.adaptiveFit = true,
     this.nearSquare = 1.1,
     this.adaptivePreload,
-    this.thumbnailCacheCapacity = 12,
-    this.maxActivePlayers,
-    this.prefetchBytesLimit,
-    this.forwardBufferDuration,
+    this.thumbnailCacheCapacity = 20,
+    this.maxActivePlayers = 5,
+    this.prefetchBytesLimit = 8 * 1024 * 1024, // 8MB
+    this.forwardBufferDuration = const Duration(seconds: 3),
+    this.previewImageBuilder,
   });
 
   @override
@@ -206,37 +221,46 @@ class _ShortsFeedState extends State<ShortsFeed> {
 
   // превью-кэш
   final LinkedHashMap<int, ImageProvider> _thumbs = LinkedHashMap();
-  final Set<int> _thumbLoading = {};
+  final Set<int> _thumbErrors = {};
   final Set<int> _firstFrameSeen = {};
   final Map<int, int> _startupMs = {};
   final Map<int, int> _firstFrameMs = {};
   final Map<int, int> _rebufferCount = {};
   final Map<int, int> _rebufferDurationMs = {};
   final Map<int, int> _lastRebufferDurationMs = {};
+  final Set<int> _priming = {};
   DateTime? _lastSmoothPlayback;
   DateTime? _lastRebuffer;
-
+  
   bool _isValidIndex(int index) =>
       index >= 0 && index < widget.urls.length;
 
-  Future<void> _primeIndex(int index) async {
+  void _primeIndex(int index) {
     if (!_isValidIndex(index)) return;
-    await _ctrl.prewarmAround(index, forward: 0, backward: 0);
+    if (!_priming.add(index)) return;
+    unawaited(_ctrl
+        .prewarmAround(index, forward: 0, backward: 0)
+        .whenComplete(() => _priming.remove(index)));
   }
 
   void _schedulePrefetch(int index) {
     if (!_isValidIndex(index)) return;
 
+    // Параллельная загрузка для мгновенного отклика
+    final futures = <Future>[];
+    
     void queue(int idx) {
       if (_isValidIndex(idx)) {
-        unawaited(_ctrl.ensureMetadata(idx));
+        futures.add(_ctrl.ensureMetadata(idx));
       }
     }
 
     queue(index);
     queue(index + 1);
     queue(index - 1);
-
+    
+    // Параллельно загружаем метаданные и превью
+    unawaited(Future.wait(futures));
     _ensureThumb(index);
   }
 
@@ -275,22 +299,34 @@ class _ShortsFeedState extends State<ShortsFeed> {
     _sub = _ctrl.events.listen(_onEvent);
 
     await _ctrl.append(widget.urls);
-    // прогрев окна вокруг 0
+
+    // Подготовим превью-кадры как можно раньше, чтобы не мигал чёрный экран
+    for (int i = 0; i <= min(3, widget.urls.length - 1); i++) {
+      _ensureThumb(i);
+    }
+
+    // Агрессивный прогрев для мгновенного старта
     final initialFwd = _effectiveForward();
     final initialBack = _effectiveBackward();
     await _ctrl.prewarmAround(0, forward: initialFwd, backward: initialBack);
-    unawaited(_ctrl.ensureMetadata(0));
-    unawaited(_ctrl.ensureMetadata(0 + 1));
-    await _ctrl.onActive(0);
-    // прогрев превью
-    _ensureThumb(0);
-    for (int i = 1; i <= widget.preloadWindow.fwd; i++) {
-      _ensureThumb(i);
+    
+    // Мгновенная загрузка метаданных и превью для первых элементов
+    final futures = <Future>[];
+    for (int i = 0; i <= min(2, widget.urls.length - 1); i++) {
+      futures.add(_ctrl.ensureMetadata(i));
     }
+    await Future.wait(futures);
+    
+    // Сразу начинаем загрузку первого видео
+    await _ctrl.onActive(0, autoPlay: true);
+    
     setState(() {});
   }
 
   void _onEvent(ShortsEvent e) {
+    if (e is ReadyEvent) {
+      _completePreview(e.index, triggerPlayback: true);
+    }
     if (e is OnBufferingStart) {
       if (e.index == _current) setState(() => _buffering = true);
       _recordRebuffer();
@@ -341,7 +377,15 @@ class _ShortsFeedState extends State<ShortsFeed> {
       if (mounted) {
         setState(() {});
       }
+      if (kDebugMode) {
+        debugPrint(
+            'ShortsFeed: metrics index=$idx startup=${e.startupMs ?? -1}ms '
+            'firstFrame=${e.firstFrameMs ?? -1}ms '
+            'rebufferCount=${e.rebufferCount} '
+            'rebufferDuration=${e.rebufferDurationMs}ms');
+      }
     } else if (e is FirstFrameEvent) {
+      _completePreview(e.index, triggerPlayback: true);
       bool shouldUpdate = false;
       if (_firstFrameSeen.add(e.index)) {
         shouldUpdate = true;
@@ -353,6 +397,12 @@ class _ShortsFeedState extends State<ShortsFeed> {
       _recordSmoothPlayback();
       if (shouldUpdate && mounted) {
         setState(() {});
+      }
+      if (kDebugMode) {
+        debugPrint('ShortsFeed: first frame rendered index=${e.index}');
+      }
+      if (_thumbErrors.contains(e.index)) {
+        _ensureThumb(e.index);
       }
     }
   }
@@ -383,14 +433,14 @@ class _ShortsFeedState extends State<ShortsFeed> {
 
     final target = _current + dir;
     _prewarmDirection(
-        dir, target, _speedPxPerMs >= widget.scrollPrewarm.fastSwipeSpeed);
+        dir, target, (_speedPxPerMs >= widget.scrollPrewarm.fastSwipeSpeed));
   }
 
-  Future<void> _prewarmDirection(int dir, int target, bool fast) async {
+  void _prewarmDirection(int dir, int target, bool fast) {
     if (!_isValidIndex(target)) return;
 
-    // прогреваем целевую
-    await _primeIndex(target);
+    // Мгновенный прогрев для TikTok-подобной скорости
+    _primeIndex(target);
     _schedulePrefetch(target);
 
     final forwardRange = dir > 0
@@ -399,7 +449,7 @@ class _ShortsFeedState extends State<ShortsFeed> {
     for (int k = 1; k <= forwardRange; k++) {
       final idx = target + dir * k;
       if (!_isValidIndex(idx)) continue;
-      await _primeIndex(idx);
+      _primeIndex(idx);
       _schedulePrefetch(idx);
     }
 
@@ -409,20 +459,23 @@ class _ShortsFeedState extends State<ShortsFeed> {
     for (int k = 1; k <= oppositeRange; k++) {
       final idx = _current + (dir > 0 ? -k : k);
       if (!_isValidIndex(idx)) continue;
-
-      await _primeIndex(idx);
+      _primeIndex(idx);
       _schedulePrefetch(idx);
     }
   }
 
   Future<void> _changePage(int i) async {
-    await _ctrl.onInactive(_current);
+    // Мгновенное переключение без ожидания
+    _ctrl.onInactive(_current);
     _current = i;
-    await _ctrl.onActive(i);
-    await _ctrl.prewarmAround(i,
-        forward: _effectiveForward(), backward: _effectiveBackward());
-
+    
+    // Параллельное выполнение для максимальной скорости
+    final futures = <Future>[
+      _ctrl.onActive(i, autoPlay: true),
+      _ctrl.prewarmAround(i, forward: _effectiveForward(), backward: _effectiveBackward()),
+    ];
     _schedulePrefetch(i);
+    
     widget.onPageChanged?.call(i);
     setState(() {
       _buffering = false;
@@ -430,25 +483,49 @@ class _ShortsFeedState extends State<ShortsFeed> {
       _posMs = 0;
       _bufMs = 0;
     });
+    // Не ждем завершения - переключение мгновенное
+    unawaited(Future.wait(futures));
   }
 
   Future<void> _ensureThumb(int index) async {
     if (!widget.showThumbnailsWhileBuffering) return;
-    if (_thumbs.containsKey(index) || _thumbLoading.contains(index)) return;
-
-    _thumbLoading.add(index); // <— пометили, что грузим
-    if (mounted) setState(() {}); // чтобы overlay увидел thumbnailLoading=true
-
-    try {
-      final bytes = await _ctrl.getThumbnail(index);
-      if (bytes != null && bytes.isNotEmpty) {
-        _storeThumbnail(index, MemoryImage(bytes));
-      }
-    } catch (_) {
-      // игнорируем — просто не будет превью
-    } finally {
-      _thumbLoading.remove(index);
+    final external = _externalPreview(index);
+    if (external != null) {
+      _storeThumbnail(index, external);
+      _thumbErrors.remove(index);
       if (mounted) setState(() {});
+      return;
+    }
+    if (_thumbs.containsKey(index)) return;
+    _thumbErrors.remove(index);
+    if (mounted) setState(() {});
+  }
+
+  void _retryThumbnail(int index) {
+    if (!_isValidIndex(index)) return;
+    _thumbErrors.remove(index);
+    _thumbs.remove(index);
+    _ensureThumb(index);
+    if (mounted) setState(() {});
+  }
+
+  void _completePreview(int index, {bool triggerPlayback = false}) {
+    if (triggerPlayback && mounted && _current == index) {
+      unawaited(_ctrl.play(index));
+    }
+  }
+
+  ImageProvider? _externalPreview(int index) {
+    final builder = widget.previewImageBuilder;
+    if (builder == null) return null;
+    try {
+      final provider = builder(index);
+      return provider;
+    } catch (err) {
+      if (kDebugMode) {
+        debugPrint('ShortsFeed: external preview builder failed for index $index – $err');
+      }
+      return null;
     }
   }
 
@@ -469,6 +546,11 @@ class _ShortsFeedState extends State<ShortsFeed> {
         itemCount: widget.urls.length,
         onPageChanged: _changePage,
         itemBuilder: (ctx, i) {
+          const isShowingPreview = false;
+          const previewRemainingMs = 0;
+          const isThumbLoading = false;
+          final hasThumbError = _thumbErrors.contains(i);
+          
           final overlay = widget.overlayBuilder?.call(
             ctx,
             i,
@@ -482,7 +564,7 @@ class _ShortsFeedState extends State<ShortsFeed> {
               direction: ((_pageCtrl.page ?? _current.toDouble()) - _current)
                   .sign
                   .toInt(),
-              thumbnailLoading: _thumbLoading.contains(i),
+              thumbnailLoading: isThumbLoading,
               hasThumbnail: _thumbs.containsKey(i),
               firstFrameRendered: _firstFrameSeen.contains(i),
               startupMs: _startupMs[i] ?? -1,
@@ -490,6 +572,9 @@ class _ShortsFeedState extends State<ShortsFeed> {
               rebufferCount: _rebufferCount[i] ?? 0,
               rebufferDurationMs: _rebufferDurationMs[i] ?? 0,
               lastRebufferDurationMs: _lastRebufferDurationMs[i] ?? 0,
+              showingPreview: isShowingPreview,
+              previewRemainingMs: previewRemainingMs,
+              thumbnailError: hasThumbError,
             ),
           );
           return _FeedItem(
@@ -499,10 +584,15 @@ class _ShortsFeedState extends State<ShortsFeed> {
             thumbnail: _thumbs[i],
             overlay: overlay,
             fit: widget.fit,
-            showCover: !_firstFrameSeen.contains(i),
+            showCover: !_firstFrameSeen.contains(i) || isShowingPreview,
             adaptiveFit: widget.adaptiveFit,
             nearSquare: widget.nearSquare,
             coverBuilder: widget.coverBuilder,
+            showingPreview: isShowingPreview,
+            previewRemainingMs: previewRemainingMs,
+            thumbnailLoading: isThumbLoading,
+            thumbnailError: hasThumbError,
+            onRetryThumbnail: () => _retryThumbnail(i),
           );
         },
       ),
@@ -579,6 +669,9 @@ class _ShortsFeedState extends State<ShortsFeed> {
     _thumbs.remove(index);
     _thumbs[index] = provider;
     _trimThumbnailCache();
+    if (mounted) {
+      unawaited(precacheImage(provider, context).catchError((_) {}));
+    }
   }
 
   void _trimThumbnailCache() {
@@ -601,6 +694,11 @@ class _FeedItem extends StatefulWidget {
   final bool adaptiveFit;
   final double nearSquare;
   final CoverBuilder? coverBuilder;
+  final bool showingPreview;
+  final int previewRemainingMs;
+  final bool thumbnailLoading;
+  final bool thumbnailError;
+  final VoidCallback onRetryThumbnail;
 
   const _FeedItem({
     required this.index,
@@ -613,6 +711,11 @@ class _FeedItem extends StatefulWidget {
     required this.adaptiveFit,
     required this.nearSquare,
     required this.coverBuilder,
+    required this.showingPreview,
+    required this.previewRemainingMs,
+    required this.thumbnailLoading,
+    required this.thumbnailError,
+    required this.onRetryThumbnail,
   });
 
   @override
@@ -714,6 +817,11 @@ class _FeedItemState extends State<_FeedItem>
     return _DefaultCover(
       thumbnail: widget.thumbnail,
       buffering: widget.buffering,
+      showingPreview: widget.showingPreview,
+      previewRemainingMs: widget.previewRemainingMs,
+      thumbnailLoading: widget.thumbnailLoading,
+      thumbnailError: widget.thumbnailError,
+      onRetry: widget.onRetryThumbnail,
     );
   }
 }
@@ -721,37 +829,170 @@ class _FeedItemState extends State<_FeedItem>
 class _DefaultCover extends StatelessWidget {
   final ImageProvider? thumbnail;
   final bool buffering;
+  final bool showingPreview;
+  final int previewRemainingMs;
+  final bool thumbnailLoading;
+  final bool thumbnailError;
+  final VoidCallback onRetry;
 
-  const _DefaultCover({this.thumbnail, required this.buffering});
+  const _DefaultCover({
+    this.thumbnail, 
+    required this.buffering,
+    required this.showingPreview,
+    required this.previewRemainingMs,
+    required this.thumbnailLoading,
+    required this.thumbnailError,
+    required this.onRetry,
+  });
 
   @override
   Widget build(BuildContext context) {
-    final hasThumbnail = thumbnail != null;
-    return DecoratedBox(
-      decoration: const BoxDecoration(color: Colors.black),
-      child: Stack(
-        fit: StackFit.expand,
-        children: [
-          if (hasThumbnail)
-            FittedBox(
-              fit: BoxFit.cover,
-              child: Image(image: thumbnail!),
+    final countdownSeconds =
+        previewRemainingMs > 0 ? (previewRemainingMs / 1000).ceil() : 0;
+
+    final children = <Widget>[
+      Positioned.fill(child: _buildBaseLayer(context)),
+    ];
+
+    if (!thumbnailError && (thumbnailLoading || buffering)) {
+      children.add(_buildLoadingOverlay());
+    }
+
+    if (!thumbnailError &&
+        showingPreview &&
+        thumbnail != null &&
+        countdownSeconds > 0) {
+      children.add(_buildPreviewOverlay(countdownSeconds));
+    }
+
+    return Stack(
+      fit: StackFit.expand,
+      children: children,
+    );
+  }
+
+  Widget _buildBaseLayer(BuildContext context) {
+    if (thumbnail != null) {
+      return DecoratedBox(
+        decoration: BoxDecoration(
+          image: DecorationImage(
+            image: thumbnail!,
+            fit: BoxFit.cover,
+          ),
+        ),
+      );
+    }
+    if (thumbnailError) {
+      return _buildErrorFallback(context);
+    }
+    return const ColoredBox(color: Colors.black);
+  }
+
+  Widget _buildLoadingOverlay() {
+    return Container(
+      color: Colors.black.withValues(alpha: 0.25),
+      child: const Center(
+        child: SizedBox(
+          width: 40,
+          height: 40,
+          child: CircularProgressIndicator(
+            strokeWidth: 3,
+            valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+            backgroundColor: Colors.white24,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPreviewOverlay(int countdownSeconds) {
+    return Container(
+      color: Colors.black54,
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(
+              Icons.play_circle_outline,
+              size: 64,
+              color: Colors.white,
             ),
-          if (hasThumbnail)
-            DecoratedBox(
-              decoration: BoxDecoration(
-                color: Colors.black.withOpacity(0.35),
+            const SizedBox(height: 16),
+            const Text(
+              'Превью видео',
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: 18,
+                fontWeight: FontWeight.bold,
               ),
             ),
-          if (buffering)
-            const Center(
-              child: SizedBox(
-                width: 32,
-                height: 32,
-                child: CircularProgressIndicator(strokeWidth: 2),
+            if (countdownSeconds > 0) ...[
+              const SizedBox(height: 8),
+              Text(
+                'Старт через $countdownSeconds с',
+                style: const TextStyle(
+                  color: Colors.white70,
+                  fontSize: 14,
+                ),
               ),
-            ),
-        ],
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildErrorFallback(BuildContext context) {
+    return Container(
+      decoration: const BoxDecoration(
+        gradient: LinearGradient(
+          colors: [
+            Color(0xFF1F1F1F),
+            Color(0xFF121212),
+          ],
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+        ),
+      ),
+      child: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 260),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(
+                Icons.image_not_supported_outlined,
+                size: 56,
+                color: Colors.white70,
+              ),
+              const SizedBox(height: 16),
+              const Text(
+                'Не удалось загрузить превью',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 16,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Проверьте подключение и попробуйте снова.',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: Colors.white70,
+                  fontSize: 14,
+                ),
+              ),
+              const SizedBox(height: 16),
+              ElevatedButton.icon(
+                onPressed: onRetry,
+                icon: const Icon(Icons.refresh),
+                label: const Text('Повторить'),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }

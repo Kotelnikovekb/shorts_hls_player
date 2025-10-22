@@ -24,6 +24,7 @@ class ShortsController with ChangeNotifier {
             scrollSpeedPxPerMs: 0,
             direction: 0,
             thumbnailLoading: false,
+            thumbnailError: false,
             hasThumbnail: false,
             firstFrameRendered: false,
             startupMs: -1,
@@ -31,6 +32,8 @@ class ShortsController with ChangeNotifier {
             rebufferCount: 0,
             rebufferDurationMs: 0,
             lastRebufferDurationMs: 0,
+            showingPreview: false,
+            previewRemainingMs: 0,
           );
 
   bool _isPaused = true;
@@ -158,6 +161,12 @@ class ShortsController with ChangeNotifier {
   }
 
   Future<VideoMeta> ensureMetadata(int index) {
+    final cached = _meta[index];
+    if (cached != null) {
+      // возвращаем сразу, чтобы не гонять платформу повторно
+      return SynchronousFuture<VideoMeta>(cached);
+    }
+
     // мемоизация, чтобы параллельные вызовы не слали дубликаты в натив
     final existing = _metaFutures[index];
     if (existing != null) return existing;
@@ -259,9 +268,15 @@ class ShortsController with ChangeNotifier {
     await Future.wait(futures);
   }
 
-  Future<void> onActive(int index) async {
+  Future<void> onActive(int index, {bool autoPlay = true}) async {
     await _p.setCurrent(index);
-    await _p.play(index);
+    if (autoPlay) {
+      await _p.play(index);
+      _isPaused = false;
+    } else {
+      _isPaused = true;
+    }
+    notifyListeners();
   }
 
   Future<void> onInactive(int index) async {

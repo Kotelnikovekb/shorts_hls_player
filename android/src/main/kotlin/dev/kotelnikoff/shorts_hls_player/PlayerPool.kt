@@ -1,12 +1,21 @@
 package dev.kotelnikoff.shorts_hls_player
 
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Matrix
+import android.graphics.Paint
+import android.graphics.RectF
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.util.Log
 import android.view.Surface
+import android.view.PixelCopy
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.TrackSelectionParameters
@@ -23,6 +32,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.abs
+import java.util.Locale
 
 internal class PlayerPool(
     private val context: android.content.Context,
@@ -57,6 +67,20 @@ internal class PlayerPool(
     private val thumbnailExecutor: ExecutorService = Executors.newCachedThreadPool()
 
     private var activeIndex: Int? = null
+
+    companion object {
+        private const val TAG = "ShortsPlayerPool"
+        private val PREVIEW_ATTEMPTS_US = longArrayOf(
+            0L,
+            100_000L,
+            300_000L,
+            600_000L,
+            1_000_000L,
+            1_600_000L,
+        )
+        private const val LUMA_THRESHOLD = 0.035f
+        private const val MAX_LUMA_SAMPLES = 400
+    }
 
     // глобальные настройки
     private var looping: Boolean = false
@@ -213,6 +237,8 @@ internal class PlayerPool(
             runCatching { entries[index]?.player?.clearVideoSurface() }
         }
         surfacesByIndex[index] = surface
+        // Попробуем отрисовать превью-кадр (если есть) прямо в Surface — чтобы не было чёрного экрана
+        drawThumbnailIntoSurface(index, surface)
         entries[index]?.player?.setVideoSurface(surface)
     }
 
@@ -247,6 +273,7 @@ internal class PlayerPool(
         val prev = prevIdx?.let { entries[it] }
         if (prev != null && prev !== e) {
             prev.player.pause()
+            prev.player.playWhenReady = false
             cancelProgressWatcher(prev)
         }
 
@@ -259,11 +286,10 @@ internal class PlayerPool(
         applyLooping(e)
         url?.let { prefetcher.prefetch(it) }
 
-        e.player.playWhenReady = true
-        e.player.play()
+        e.player.playWhenReady = false
+        e.player.pause()
+        cancelProgressWatcher(e)
         activeIndex = index
-
-        if (e.player.isPlaying) scheduleProgressWatcher(index, e)
 
         when (e.player.playbackState) {
             Player.STATE_READY -> {
@@ -487,6 +513,7 @@ internal class PlayerPool(
                     onFirstFrame?.invoke(index)
                 }
                 reportMetrics(index, e.metrics)
+                captureSnapshotForCache(index, e)
             }
         })
         e.listenerAdded = true
@@ -516,6 +543,35 @@ internal class PlayerPool(
         }
         e.progressRunnable = r
         mainHandler.postDelayed(r, progressIntervalMs)
+    }
+
+    private fun captureSnapshotForCache(index: Int, entry: Entry) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        if (thumbnailCache.containsKey(index)) return
+        val surface = surfacesByIndex[index] ?: return
+        val vs = entry.player.videoSize
+        val width = if (vs.width > 0) vs.width else 360
+        val height = if (vs.height > 0) vs.height else 640
+        if (width <= 0 || height <= 0) return
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        try {
+            PixelCopy.request(surface, bitmap, { result ->
+                if (result == PixelCopy.SUCCESS) {
+                    thumbnailExecutor.execute {
+                        val bytes = compressBitmap(bitmap)
+                        if (bytes != null) {
+                            thumbnailCache[index] = bytes
+                            Log.d(TAG, "Cached snapshot from playback index=$index")
+                        }
+                        bitmap.recycle()
+                    }
+                } else {
+                    bitmap.recycle()
+                }
+            }, mainHandler)
+        } catch (t: Throwable) {
+            bitmap.recycle()
+        }
     }
 
     private fun cancelProgressWatcher(e: Entry) {
@@ -606,25 +662,7 @@ internal class PlayerPool(
                 val retriever = MediaMetadataRetriever()
                 try {
                     retriever.setDataSource(context, Uri.parse(url))
-                    val attempts = longArrayOf(0L, 300_000L, 600_000L)
-                    var bmp: Bitmap? = null
-                    for (timeUs in attempts) {
-                        bmp = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
-                        if (bmp != null) break
-                        bmp = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-                        if (bmp != null) break
-                    }
-                    if (bmp == null) {
-                        bmp = retriever.frameAtTime
-                    }
-                    if (bmp != null) {
-                        ByteArrayOutputStream().use { baos ->
-                            bmp.compress(Bitmap.CompressFormat.JPEG, 85, baos)
-                            baos.toByteArray()
-                        }
-                    } else {
-                        null
-                    }
+                    extractMeaningfulThumbnail(index, retriever)
                 } finally {
                     retriever.release()
                 }
@@ -632,8 +670,139 @@ internal class PlayerPool(
 
             if (data != null) {
                 thumbnailCache[index] = data
+                // Если уже есть Surface — отрисуем превью (до первого кадра видео)
+                surfacesByIndex[index]?.let { s ->
+                    drawThumbnailIntoSurface(index, s)
+                }
+            } else {
+                Log.w(TAG, "Thumbnail extraction failed for index=$index url=$url")
             }
             mainHandler.post { callback(data) }
+        }
+    }
+
+    private fun extractMeaningfulThumbnail(index: Int, retriever: MediaMetadataRetriever): ByteArray? {
+        for (timeUs in PREVIEW_ATTEMPTS_US) {
+            val bmp = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                ?: retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                ?: continue
+            val luminance = averageLuminance(bmp)
+            val lumaLabel = String.format(Locale.US, "%.3f", luminance)
+            val meaningful = luminance >= LUMA_THRESHOLD
+            if (meaningful) {
+                val bytes = compressBitmap(bmp)
+                bmp.recycle()
+                if (bytes != null) {
+                    Log.d(
+                        TAG,
+                        "Thumbnail captured index=$index timeUs=$timeUs luma=$lumaLabel"
+                    )
+                    return bytes
+                }
+            } else {
+                Log.d(
+                    TAG,
+                    "Discarded dark frame index=$index timeUs=$timeUs luma=$lumaLabel"
+                )
+                bmp.recycle()
+            }
+        }
+
+        val fallback = retriever.frameAtTime
+        if (fallback != null) {
+            val luminance = averageLuminance(fallback)
+            val lumaLabel = String.format(Locale.US, "%.3f", luminance)
+            if (luminance >= LUMA_THRESHOLD) {
+                val bytes = compressBitmap(fallback)
+                fallback.recycle()
+                if (bytes != null) {
+                    Log.d(
+                        TAG,
+                        "Thumbnail fallback frameAtTime used index=$index luma=$lumaLabel"
+                    )
+                    return bytes
+                }
+            } else {
+                Log.d(
+                    TAG,
+                    "Fallback frame still dark index=$index luma=$lumaLabel"
+                )
+                fallback.recycle()
+            }
+        }
+        return null
+    }
+
+    private fun compressBitmap(bmp: Bitmap): ByteArray? {
+        return runCatching {
+            ByteArrayOutputStream().use { baos ->
+                bmp.compress(Bitmap.CompressFormat.JPEG, 85, baos)
+                baos.toByteArray()
+            }
+        }.getOrNull()
+    }
+
+    private fun averageLuminance(bmp: Bitmap): Float {
+        val w = bmp.width
+        val h = bmp.height
+        if (w <= 0 || h <= 0) return 0f
+        val stepX = maxOf(1, w / 24)
+        val stepY = maxOf(1, h / 24)
+        var samples = 0
+        var total = 0f
+        val maxSamples = MAX_LUMA_SAMPLES
+        var y = 0
+        while (y < h && samples < maxSamples) {
+            var x = 0
+            while (x < w && samples < maxSamples) {
+                val color = bmp.getPixel(x, y)
+                val r = Color.red(color)
+                val g = Color.green(color)
+                val b = Color.blue(color)
+                val luma = 0.2126f * r + 0.7152f * g + 0.0722f * b
+                total += luma
+                samples++
+                x += stepX
+            }
+            y += stepY
+        }
+        if (samples == 0) return 0f
+        return total / (samples * 255f)
+    }
+
+    /**
+     * Отрисовать превью-кадр в Surface как плейсхолдер до первого кадра видео.
+     * Масштабирование по принципу centerCrop (аналог BoxFit.cover / resizeAspectFill).
+     */
+    private fun drawThumbnailIntoSurface(index: Int, surface: Surface) {
+        val bytes = thumbnailCache[index] ?: return
+        val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return
+        runCatching {
+            val canvas: Canvas = surface.lockCanvas(null)
+            try {
+                // Зальём фон чёрным
+                canvas.drawColor(Color.BLACK)
+
+                val dst = RectF(0f, 0f, canvas.width.toFloat(), canvas.height.toFloat())
+                val src = RectF(0f, 0f, bmp.width.toFloat(), bmp.height.toFloat())
+
+                val m = Matrix()
+                // Рассчитываем масштаб для покрытия (centerCrop)
+                val scale = maxOf(dst.width() / src.width(), dst.height() / src.height())
+                val scaledW = src.width() * scale
+                val scaledH = src.height() * scale
+                val dx = (dst.width() - scaledW) / 2f
+                val dy = (dst.height() - scaledH) / 2f
+                m.postScale(scale, scale)
+                m.postTranslate(dx, dy)
+
+                val p = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+                canvas.drawBitmap(bmp, m, p)
+            } finally {
+                surface.unlockCanvasAndPost(canvas)
+            }
+        }.onFailure {
+            // игнорируем — ничего страшного, просто останется чёрный экран до первого кадра
         }
     }
 

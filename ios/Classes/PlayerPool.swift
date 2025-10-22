@@ -38,17 +38,20 @@ final class PlayerPool {
 
 
   private let thumbCache = NSCache<NSNumber, NSData>()
+  private let thumbnailSampleSeconds: [Double] = [0.0, 0.12, 0.3, 0.6, 1.0, 1.6]
+  private lazy var thumbnailSampleTimes: [CMTime] = thumbnailSampleSeconds.map {
+    CMTime(seconds: $0, preferredTimescale: 600)
+  }
+  private let luminanceThreshold: Double = 0.035
 
   func getThumbnail(index: Int, completion: @escaping (Data?) -> Void) {
       guard index >= 0, index < urls.count else { completion(nil); return }
 
-      // из кэша
       if let cached = thumbCache.object(forKey: NSNumber(value: index)) {
         completion(Data(referencing: cached))
         return
       }
 
-      // берём asset: либо из уже подготовленного host, либо создаём новый AVURLAsset
       let asset: AVURLAsset
       if let e = entries[index] {
         asset = e.host.asset
@@ -56,21 +59,27 @@ final class PlayerPool {
         asset = AVURLAsset(url: urls[index])
       }
 
-      let gen = AVAssetImageGenerator(asset: asset)
-      gen.appliesPreferredTrackTransform = true
-      // кадр на 0.5s (если нет — 0.0)
-      let time = CMTime(seconds: 0.5, preferredTimescale: 600)
-      gen.generateCGImagesAsynchronously(forTimes: [NSValue(time: time)]) { [weak self] _, cg, _, _, _ in
-        guard let self = self else { completion(nil); return }
-        var dataOut: Data?
-        if let cg = cg {
-          let ui = UIImage(cgImage: cg)
-          dataOut = ui.pngData()
-          if let d = dataOut {
-            self.thumbCache.setObject(d as NSData, forKey: NSNumber(value: index))
-          }
+      DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        guard let self = self else {
+          DispatchQueue.main.async { completion(nil) }
+          return
         }
-        DispatchQueue.main.async { completion(dataOut) }
+
+        let dataOut = self.makeThumbnail(from: asset)
+        if let d = dataOut {
+          self.thumbCache.setObject(d as NSData, forKey: NSNumber(value: index))
+          #if DEBUG
+          print("Thumbnail captured index=\(index) bytes=\(d.count)")
+          #endif
+        } else {
+          #if DEBUG
+          print("Thumbnail extraction failed for index \(index)")
+          #endif
+        }
+
+        DispatchQueue.main.async {
+          completion(dataOut)
+        }
       }
     }
 
@@ -89,85 +98,123 @@ final class PlayerPool {
     currentIndex = -1
     watchedFired.removeAll()
     for view in boundViews.values {
-      view.view?.layer.sublayers?.forEach { $0.removeFromSuperlayer() }
+      if let v = view.view {
+        let reset = {
+          v.clearPlayerLayer()
+          v.setPlaceholder(nil)
+        }
+        if Thread.isMainThread {
+          reset()
+        } else {
+          DispatchQueue.main.async(execute: reset)
+        }
+      }
+    }
+    // Прогреем превью для первых элементов, чтобы UiKitView сразу показал кадр
+    let prefetchCount = min(3, self.urls.count)
+    if prefetchCount > 0 {
+      for i in 0..<prefetchCount {
+        if thumbCache.object(forKey: NSNumber(value: i)) == nil {
+          getThumbnail(index: i) { _ in }
+        }
+      }
     }
   }
 
   func entry(for index: Int) -> Entry? { entries[index] }
 
 
-    func prime(index: Int) {
-      guard index >= 0 && index < urls.count else { return }
-      if entries[index] != nil { return }
+  func prime(index: Int) {
+    guard index >= 0 && index < urls.count else { return }
+    if entries[index] != nil { return }
 
-      let url = urls[index]
-      let host = PlayerItemHost(index: index, url: url)
-      host.forwardBufferDuration = forwardBufferSeconds
+    let url = urls[index]
+    let host = PlayerItemHost(index: index, url: url)
+    host.forwardBufferDuration = forwardBufferSeconds
 
-      // apply global flags
-      host.player.isMuted = isMuted
-      host.player.volume = volume
+    host.player.isMuted = isMuted
+    host.player.volume = volume
+    host.progressInterval = progressIntervalMs
 
-      // progress observer interval
-      host.progressInterval = progressIntervalMs
+    host.onReady = { [weak self] i in self?.send(["type":"ready","index": i]) }
+    host.onBufferingStart = { [weak self] i in self?.send(["type":"bufferingStart","index": i]) }
+    host.onBufferingEnd = { [weak self] i in self?.send(["type":"bufferingEnd","index": i]) }
+    host.onStall = { [weak self] i in self?.send(["type":"stall","index": i]) }
+    host.onError = { [weak self] i, msg in self?.send(["type":"error","index": i, "message": msg]) }
+    host.onFirstFrame = { [weak self] i in
+      guard let self = self else { return }
+      self.send(["type":"firstFrame","index": i])
+      // Плавно скрываем превью при первом кадре видео
+      if Thread.isMainThread {
+        self.boundViews[i]?.view?.hidePlaceholder()
+      } else {
+        DispatchQueue.main.async { [weak self] in
+          self?.boundViews[i]?.view?.hidePlaceholder()
+        }
+      }
+    }
 
-      // events → EventChannel и/или метод-коллбек
-      host.onReady = { [weak self] i in self?.send(["type":"ready","index": i]) }
-      host.onBufferingStart = { [weak self] i in self?.send(["type":"bufferingStart","index": i]) }
-      host.onBufferingEnd = { [weak self] i in self?.send(["type":"bufferingEnd","index": i]) }
-      host.onStall = { [weak self] i in self?.send(["type":"stall","index": i]) }
-      host.onError = { [weak self] i, msg in self?.send(["type":"error","index": i, "message": msg]) }
-      host.onFirstFrame = { [weak self] i in self?.send(["type":"firstFrame","index": i]) }
+    host.onProgress = { [weak self] idx, posMs, durMs in
+      guard let self = self else { return }
+      self.send(["type":"progress","index": idx, "posMs": posMs, "durMs": durMs as Any])
 
-      host.onProgress = { [weak self] idx, posMs, durMs in
-        guard let self = self else { return }
-        // EventChannel (как было)
-        self.send(["type":"progress","index": idx, "posMs": posMs, "durMs": durMs as Any])
-
-        // MethodChannel-коллбек 'onProgress' (с bufferedMs)
-        if self.progressEnabled, let e = self.entries[idx] {
-          let bufferedMs = Int(self.bufferedDurationMs(for: e.item))
-          self.methodInvoker?.invoke(
-            name: "onProgress",
-            args: ["index": idx, "url": e.url.absoluteString, "positionMs": posMs, "durationMs": durMs ?? -1, "bufferedMs": bufferedMs]
-          )
-          // 'onWatched' при 95% или завершении
-          if durMs != nil, durMs! > 0, !self.watchedFired.contains(idx) {
-            if Double(posMs) >= 0.95 * Double(durMs!) {
-              self.watchedFired.insert(idx)
-              self.methodInvoker?.invoke(
-                name: "onWatched",
-                args: ["index": idx, "url": e.url.absoluteString]
-              )
-            }
+      if posMs > 0 {
+        // Плавно скрываем превью при начале воспроизведения
+        if Thread.isMainThread {
+          self.boundViews[idx]?.view?.hidePlaceholder()
+        } else {
+          DispatchQueue.main.async { [weak self] in
+            self?.boundViews[idx]?.view?.hidePlaceholder()
           }
         }
       }
 
-      // loop: слушаем конец и переигрываем
-      host.onCompleted = { [weak self] idx in
-        guard let self = self, self.isLooping, let e = self.entries[idx] else { return }
-        e.player.seek(to: .zero)
-        e.player.play()
+      if self.progressEnabled, let e = self.entries[idx] {
+        let bufferedMs = Int(self.bufferedDurationMs(for: e.item))
+        self.methodInvoker?.invoke(
+          name: "onProgress",
+          args: ["index": idx, "url": e.url.absoluteString, "positionMs": posMs, "durationMs": durMs ?? -1, "bufferedMs": bufferedMs]
+        )
+        if durMs != nil, durMs! > 0, !self.watchedFired.contains(idx) {
+          if Double(posMs) >= 0.95 * Double(durMs!) {
+            self.watchedFired.insert(idx)
+            self.methodInvoker?.invoke(
+              name: "onWatched",
+              args: ["index": idx, "url": e.url.absoluteString]
+            )
+          }
+        }
       }
+    }
+
+    host.onCompleted = { [weak self] idx in
+      guard let self = self, self.isLooping, let e = self.entries[idx] else { return }
+      e.player.seek(to: .zero)
+      e.player.play()
+    }
 
     let entry = Entry(url: url, host: host)
     entries[index] = entry
-    if let view = boundViews[index]?.view {
-      let layer = AVPlayerLayer(player: host.player)
-      layer.videoGravity = .resizeAspectFill
-      layer.frame = view.bounds
-      view.layer.sublayers?.forEach { $0.removeFromSuperlayer() }
-      view.layer.addSublayer(layer)
-      storeLayer(layer, for: index)
-    }
+
     host.prime()
     attachViewIfPossible(index: index)
+
+    if thumbCache.object(forKey: NSNumber(value: index)) == nil {
+      getThumbnail(index: index) { _ in }
+    }
   }
 
   func dispose(index: Int) {
     if let view = boundViews[index]?.view {
-      view.layer.sublayers?.forEach { $0.removeFromSuperlayer() }
+      let clear = {
+        view.clearPlayerLayer()
+        view.setPlaceholder(nil)
+      }
+      if Thread.isMainThread {
+        clear()
+      } else {
+        DispatchQueue.main.async(execute: clear)
+      }
     }
     entries.removeValue(forKey: index) // deinit host освободит ресурсы
     boundViews.removeValue(forKey: index)
@@ -225,6 +272,58 @@ final class PlayerPool {
   
   func bindView(index: Int, view: PlayerHostingView) {
     boundViews[index] = WeakPlayerView(view)
+    // Сразу показываем черный фон, чтобы не было прозрачности
+    view.setPlaceholder(nil)
+
+    if let cached = thumbCache.object(forKey: NSNumber(value: index)) {
+      let data = Data(referencing: cached)
+      let apply = {
+        view.setPlaceholder(UIImage(data: data))
+      }
+      if Thread.isMainThread {
+        apply()
+      } else {
+        DispatchQueue.main.async(execute: apply)
+      }
+    } else {
+      // Для первых элементов пытаемся синхронно получить превью
+      if index < 3 {
+        generateThumbnailSync(index: index) { [weak self] data in
+          guard let self = self else { return }
+          let apply = {
+            guard
+              let targetView = self.boundViews[index]?.view,
+              let bytes = data,
+              let image = UIImage(data: bytes)
+            else { return }
+            targetView.setPlaceholder(image)
+          }
+          if Thread.isMainThread {
+            apply()
+          } else {
+            DispatchQueue.main.async(execute: apply)
+          }
+        }
+      } else {
+        getThumbnail(index: index) { [weak self] data in
+          guard let self = self else { return }
+          let apply = {
+            guard
+              let targetView = self.boundViews[index]?.view,
+              let bytes = data,
+              let image = UIImage(data: bytes)
+            else { return }
+            targetView.setPlaceholder(image)
+          }
+          if Thread.isMainThread {
+            apply()
+          } else {
+            DispatchQueue.main.async(execute: apply)
+          }
+        }
+      }
+    }
+
     attachViewIfPossible(index: index)
   }
 
@@ -238,13 +337,18 @@ final class PlayerPool {
       layer.player = player
     } else {
       layer = AVPlayerLayer(player: player)
-      layer.videoGravity = .resizeAspectFill
       storeLayer(layer, for: index)
     }
 
-    layer.frame = view.bounds
-    view.layer.sublayers?.forEach { $0.removeFromSuperlayer() }
-    view.layer.addSublayer(layer)
+    let applyLayer = {
+      view.setPlayerLayer(layer)
+    }
+
+    if Thread.isMainThread {
+      applyLayer()
+    } else {
+      DispatchQueue.main.async(execute: applyLayer)
+    }
   }
 
   private func updateEntry(_ index: Int, mutate: (inout Entry) -> Void) {
@@ -275,11 +379,113 @@ final class PlayerPool {
   }
 
   private func send(_ payload: [String: Any]) { onEvent?(payload) }
-    private func bufferedDurationMs(for item: AVPlayerItem) -> Double {
+  
+  // Синхронная генерация превью для первых элементов
+  private func generateThumbnailSync(index: Int, completion: @escaping (Data?) -> Void) {
+    guard index >= 0, index < urls.count else { completion(nil); return }
+    
+    if let cached = thumbCache.object(forKey: NSNumber(value: index)) {
+      completion(Data(referencing: cached))
+      return
+    }
+    
+    let asset: AVAsset = entries[index]?.host.asset ?? AVURLAsset(url: urls[index])
+
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      guard let self = self else {
+        DispatchQueue.main.async { completion(nil) }
+        return
+      }
+
+      let data = self.makeThumbnail(from: asset)
+      if let data = data {
+        self.thumbCache.setObject(data as NSData, forKey: NSNumber(value: index))
+      } else {
+        #if DEBUG
+        print("Thumbnail sync extraction failed for index \(index)")
+        #endif
+      }
+
+      DispatchQueue.main.async {
+        completion(data)
+      }
+    }
+  }
+  
+  private func bufferedDurationMs(for item: AVPlayerItem) -> Double {
         guard let range = item.loadedTimeRanges.first?.timeRangeValue else { return 0 }
         let end = CMTimeGetSeconds(range.start) + CMTimeGetSeconds(range.duration)
         let cur = CMTimeGetSeconds(item.currentTime())
         return max(0, (end - cur) * 1000.0)
       }
+}
+
+extension PlayerPool {
+  private func configuredGenerator(for asset: AVAsset) -> AVAssetImageGenerator {
+    let generator = AVAssetImageGenerator(asset: asset)
+    generator.appliesPreferredTrackTransform = true
+    generator.maximumSize = CGSize(width: 540, height: 540)
+    let tolerance = CMTime(seconds: 0.25, preferredTimescale: 600)
+    generator.requestedTimeToleranceBefore = tolerance
+    generator.requestedTimeToleranceAfter = tolerance
+    return generator
+  }
+
+  private func makeThumbnail(from asset: AVAsset) -> Data? {
+    let generator = configuredGenerator(for: asset)
+    for time in thumbnailSampleTimes {
+      guard let cgImage = try? generator.copyCGImage(at: time, actualTime: nil) else {
+        continue
+      }
+      if frameHasContent(cgImage),
+         let data = UIImage(cgImage: cgImage).jpegData(compressionQuality: 0.85) {
+        return data
+      }
+    }
+    return nil
+  }
+
+  private func frameHasContent(_ cgImage: CGImage) -> Bool {
+    guard let luminance = averageLuminance(of: cgImage) else { return true }
+    return luminance >= luminanceThreshold
+  }
+
+  private func averageLuminance(of cgImage: CGImage) -> Double? {
+    let downscaleWidth = 8
+    let downscaleHeight = 8
+    let bytesPerRow = downscaleWidth * 4
+    var pixels = [UInt8](repeating: 0, count: downscaleWidth * downscaleHeight * 4)
+
+    return pixels.withUnsafeMutableBytes { ptr -> Double? in
+      guard let context = CGContext(
+        data: ptr.baseAddress,
+        width: downscaleWidth,
+        height: downscaleHeight,
+        bitsPerComponent: 8,
+        bytesPerRow: bytesPerRow,
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+      ) else { return nil }
+
+      context.interpolationQuality = .medium
+      context.draw(cgImage, in: CGRect(x: 0, y: 0, width: downscaleWidth, height: downscaleHeight))
+
+      let buffer = ptr.bindMemory(to: UInt8.self)
+      var total: Double = 0
+      var count = 0
+
+      for i in stride(from: 0, to: buffer.count, by: 4) {
+        let r = Double(buffer[i])
+        let g = Double(buffer[i + 1])
+        let b = Double(buffer[i + 2])
+        let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
+        total += luma
+        count += 1
+      }
+
+      guard count > 0 else { return nil }
+      return total / (Double(count) * 255.0)
+    }
+  }
 }
 protocol MethodInvoker: AnyObject { func invoke(name: String, args: [String: Any]) }

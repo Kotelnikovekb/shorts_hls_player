@@ -8,6 +8,8 @@ void main() {
   runApp(const DemoApp());
 }
 
+// cd /Users/ruzibekov/Projects/shorts_hls_player/example && flutter run
+
 class DemoApp extends StatelessWidget {
   const DemoApp({super.key});
   @override
@@ -147,20 +149,10 @@ class _DemoHomeState extends State<DemoHome> {
       ),
       qualityPreset: ShortsQuality.auto,
       showThumbnailsWhileBuffering: true,
+      previewImageBuilder: (index) => NetworkImage(
+        'https://picsum.photos/720/1280?random=$index',
+      ),
       overlayBuilder: (ctx, index, st) {
-
-        if (!st.hasThumbnail && st.positionMs == 0 && st.durationMs == 0) {
-          return Center(
-            child: Container(
-              color: Colors.black,
-              child: const Text(
-                "Видео недоступно",
-                style: TextStyle(color: Colors.white),
-              ),
-            ),
-          );
-        }
-
         return Align(
           alignment: Alignment.bottomCenter,
           child: Container(
@@ -183,6 +175,10 @@ class _DemoHomeState extends State<DemoHome> {
                       style: const TextStyle(color: Colors.redAccent),
                     ),
                   ),
+                ] else if (st.showingPreview) ...[
+                  const Icon(Icons.play_circle_outline, size: 16, color: Colors.white),
+                  const SizedBox(width: 6),
+                  Text('Превью: ${(st.previewRemainingMs / 1000).ceil()}с'),
                 ] else ...[
                   if (st.buffering)
                     const SizedBox(
