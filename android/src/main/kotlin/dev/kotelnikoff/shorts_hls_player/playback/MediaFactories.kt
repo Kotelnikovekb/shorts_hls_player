@@ -16,16 +16,25 @@ internal object MediaFactories {
         val httpFactory = DefaultHttpDataSource.Factory()
             .setAllowCrossProtocolRedirects(true)
             .setUserAgent(userAgent)
+            .setConnectTimeoutMs(10000)
+            .setReadTimeoutMs(10000)
+            .setKeepPostFor302Redirects(true)
+            .setDefaultRequestProperties(
+                mapOf(
+                    "Accept-Encoding" to "gzip, deflate"
+                )
+            )
         val upstream = DefaultDataSource.Factory(context, httpFactory)
         val cacheSinkFactory = CacheDataSink.Factory()
             .setCache(cache)
-            .setFragmentSize(CacheDataSink.DEFAULT_FRAGMENT_SIZE)
+            .setFragmentSize(2 * 1024 * 1024) // 2MB вместо default 5MB
         return CacheDataSource.Factory()
             .setCache(cache)
             .setUpstreamDataSourceFactory(upstream)
             .setCacheReadDataSourceFactory(FileDataSource.Factory())
             .setCacheWriteDataSinkFactory(cacheSinkFactory)
             .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+            .setEventListener(null)
     }
 
     fun mediaSourceFactory(context: Context, cache: SimpleCache): DefaultMediaSourceFactory {

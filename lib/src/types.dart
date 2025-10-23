@@ -13,6 +13,21 @@ class VideoMeta {
   double? get aspect => width > 0 ? height / width : null;
 }
 
+class VideoPerformanceMetrics {
+  final int startupMs;
+  final int firstFrameMs;
+  final int rebufferCount;
+  final int totalRebufferMs;
+  final double averageRebufferMs;
+
+  const VideoPerformanceMetrics({
+    required this.startupMs,
+    required this.firstFrameMs,
+    required this.rebufferCount,
+    required this.totalRebufferMs,
+  }) : averageRebufferMs = rebufferCount > 0 ? totalRebufferMs / rebufferCount : 0.0;
+}
+
 class ShortsInitConfig {
   final bool looping;
   final bool muted;
@@ -56,10 +71,10 @@ class ShortsInitConfig {
 }
 
 class ShortsVariant {
-  final int? height; // 360, 480, 720...
+  final int? height;
   final int? width;
-  final int? bitrate; // bps
-  final String label; // "360p", "Auto", "Best"
+  final int? bitrate;
+  final String label;
   const ShortsVariant({
     this.height,
     this.width,
@@ -88,7 +103,6 @@ sealed class ShortsEvent {
   const ShortsEvent();
 }
 
-// Legacy event types for backward compatibility
 class OnReady extends ShortsEvent {
   final int index;
 
@@ -129,7 +143,6 @@ class OnProgress extends ShortsEvent {
   const OnProgress(this.index, this.posMs, this.durMs, this.bufferedMs);
 }
 
-// Modern event types
 class ReadyEvent extends ShortsEvent {
   final int index;
   const ReadyEvent(this.index);

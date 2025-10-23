@@ -52,14 +52,18 @@ class TextureSlot(
     /** Освободить все ресурсы (Surface + TextureEntry) */
     @Synchronized
     fun release() {
-        try {
-            surface?.release()
-        } catch (_: Throwable) { /* ignore */ }
+        surface?.let {
+            if (it.isValid) {
+                runCatching {
+                    it.release()
+                }
+            }
+        }
         surface = null
 
-        try {
+        runCatching {
             entry?.release()
-        } catch (_: Throwable) { /* ignore */ }
+        }
         entry = null
     }
 }

@@ -120,7 +120,20 @@ final class PlayerItemHost {
     ]
   }
 
-    // PlayerItemHost.swift
+  func getPlaybackInfo() -> [String: Any?] {
+    let duration = secondsIfFinite(item.duration)
+    let position = CMTimeGetSeconds(player.currentTime())
+    let size = item.presentationSize
+    return [
+      "index": index,
+      "prepared": prepared,
+      "positionMs": Int(position * 1000),
+      "durationMs": duration.map { Int($0 * 1000) } as Any,
+      "width": Int(size.width),
+      "height": Int(size.height)
+    ]
+  }
+
   func getVariants() -> [[String: Any]] {
       var out: [[String: Any]] = []
       if #available(iOS 15.0, *) {
@@ -180,6 +193,10 @@ final class PlayerItemHost {
       guard let self = self else { return }
       if it.isPlaybackLikelyToKeepUp {
         self.onBufferingEnd?(self.index)
+        if !self.firstFrameReported && self.item.status == .readyToPlay {
+          self.firstFrameReported = true
+          self.onFirstFrame?(self.index)
+        }
       }
     }
 
@@ -191,19 +208,6 @@ final class PlayerItemHost {
       self.onStall?(self.index)
     }
 
-    // progress
-    timeObs = player.addPeriodicTimeObserver(
-      forInterval: CMTimeMake(value: 300, timescale: 1000), queue: .main
-    ) { [weak self] t in
-      guard let self = self else { return }
-      let pos = Int(CMTimeGetSeconds(t) * 1000)
-      let dur: Int? = {
-        if let s = self.secondsIfFinite(self.item.duration) { return Int(s * 1000) }
-        return nil
-      }()
-      self.onProgress?(self.index, pos, dur)
-    }
-      
       let tokEnd = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main
           ) { [weak self] _ in
@@ -212,7 +216,6 @@ final class PlayerItemHost {
           }
           notifTokens.append(tokEnd)
 
-          // progress
           attachProgressObserver()
 
     let obsTimeControl = player.observe(\.timeControlStatus, options: [.new]) { [weak self] pl, _ in
@@ -223,7 +226,15 @@ final class PlayerItemHost {
       }
     }
 
-    kvo = [obsStatus, obsEmpty, obsKeepUp, obsTimeControl]
+    let obsPresentationSize = item.observe(\.presentationSize, options: [.new]) { [weak self] it, _ in
+      guard let self = self else { return }
+      if !self.firstFrameReported && it.presentationSize.width > 0 && it.presentationSize.height > 0 {
+        self.firstFrameReported = true
+        self.onFirstFrame?(self.index)
+      }
+    }
+
+    kvo = [obsStatus, obsEmpty, obsKeepUp, obsTimeControl, obsPresentationSize]
     notifTokens = [tokStall]
   }
 

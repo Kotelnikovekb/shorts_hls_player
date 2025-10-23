@@ -61,5 +61,16 @@ abstract class ShortsPlatform extends PlatformInterface {
   Future<void> primeSingle(int index);
   Future<Map<String, dynamic>?> getPlaybackInfo(int index);
 
-
+  Future<void> configureCacheSize({int? maxCacheSizeMb});
+  Future<String> getCacheState();
+  Future<Map<String, dynamic>?> getCacheStats();
+  Future<void> clearCache();
+  Future<bool> isCached(String url);
+  Future<int> getCachedBytes(String url);
+  Future<bool> removeFromCache(String url);
+  
+  // Lifecycle management
+  Future<void> onAppPaused();
+  Future<void> onAppResumed();
+  Future<void> forceSurfaceRefresh(int index);
 }

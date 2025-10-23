@@ -22,9 +22,9 @@ class ShortsHlsPlayerPlugin :
     @Volatile private var eventSink: EventChannel.EventSink? = null
 
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var pool: PlayerPool? = null
+    @Volatile private var pool: PlayerPool? = null
 
-    private val textureSlots = mutableMapOf<Int, TextureSlot>()
+    private val textureSlots = java.util.concurrent.ConcurrentHashMap<Int, TextureSlot>()
     private var poolConfig: PlayerPool.Config = PlayerPool.Config()
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
@@ -84,16 +84,31 @@ class ShortsHlsPlayerPlugin :
             onReady = { idx -> emitReady(idx) },
             onBuffering = { idx, isBuf -> if (isBuf) emitBufferingStart(idx) else emitBufferingEnd(idx) },
             onFirstFrame = { idx -> emitFirstFrame(idx) },
-            onMetrics = { idx, metrics -> emitMetrics(idx, metrics) }
+            onMetrics = { idx, metrics -> emitMetrics(idx, metrics) },
+            onVideoSizeChanged = { idx, w, h ->
+                textureSlots[idx]?.let { slot ->
+                    runCatching { slot.updateBufferSize(w, h) }
+                }
+            }
         )
     }
 
     private fun releaseAll() {
-        textureSlots.values.forEach { runCatching { it.release() } }
+        val slotsToRelease = textureSlots.values.toList()
         textureSlots.clear()
-        pool?.release()
+        slotsToRelease.forEach {
+            runCatching {
+                it.release()
+            }
+        }
+
+        val currentPool = pool
         pool = null
-        CacheHolder.release()
+        currentPool?.release()
+
+        runCatching {
+            CacheHolder.release()
+        }
     }
 
     // ---- MethodChannel
@@ -122,12 +137,15 @@ class ShortsHlsPlayerPlugin :
                 pool?.setMuted(muted)
                 pool?.setVolume(volume)
 
-                call.argument<String>("quality")?.let { applyQualityPreset(it) }
+                (call.argument<String>("quality") ?: call.argument<String>("qualityPreset"))
+                    ?.let { applyQualityPreset(it) }
 
-                val progressEnabled = call.argument<Boolean>("progressEnabled") ?: false
-                val intervalMs =
-                    call.argument<Number>("progressIntervalMs")?.toLong()
-                        ?: call.argument<Number>("progressInterval")?.toLong()
+                val progressEnabledFlat = call.argument<Boolean>("progressEnabled")
+                val intervalFlat = call.argument<Number>("progressIntervalMs")?.toLong()
+                    ?: call.argument<Number>("progressInterval")?.toLong()
+                val trackingMap = call.argument<Map<String, Any?>>("progressTracking")
+                val progressEnabled = trackingMap?.get("enabled") as? Boolean ?: progressEnabledFlat ?: false
+                val intervalMs = (trackingMap?.get("intervalMs") as? Number)?.toLong() ?: intervalFlat
                 pool?.setProgressTracking(progressEnabled, intervalMs)
                 result.success(null)
             }
@@ -244,15 +262,94 @@ class ShortsHlsPlayerPlugin :
                 poolRef.getThumbnail(index) { data -> result.success(data) }
             }
 
+            "getPlaybackInfo" -> {
+                ensurePool()
+                val index = (call.argument<Number>("index") ?: -1).toInt()
+                if (index < 0) {
+                    result.error("INVALID_INDEX", "Index must be >= 0", null)
+                    return
+                }
+                val info = pool?.getPlaybackInfo(index)
+                result.success(info)
+            }
+
             "disposeIndex" -> {
                 val index = (call.argument<Number>("index") ?: -1).toInt()
                 if (index < 0) { result.error("INVALID_INDEX", "Index must be >= 0", null); return }
-                textureSlots.remove(index)?.release()
+                val slot = textureSlots.remove(index)
                 pool?.disposeIndex(index)
+                slot?.release()
                 result.success(null)
             }
 
             "release" -> { releaseAll(); result.success(null) }
+
+            "configureCacheSize" -> {
+                val maxCacheSizeMb = call.argument<Number>("maxCacheSizeMb")?.toInt()
+                CacheHolder.configure(maxCacheSizeMb)
+                result.success(null)
+            }
+
+            "getCacheState" -> {
+                result.success(CacheHolder.getState().name)
+            }
+
+            "getCacheStats" -> {
+                result.success(CacheHolder.getStats())
+            }
+
+            "clearCache" -> {
+                CacheHolder.clearCache()
+                result.success(null)
+            }
+
+            "isCached" -> {
+                val url = call.argument<String>("url")
+                if (url.isNullOrEmpty()) {
+                    result.error("INVALID_URL", "URL cannot be null or empty", null)
+                    return
+                }
+                result.success(CacheHolder.isCached(url))
+            }
+
+            "getCachedBytes" -> {
+                val url = call.argument<String>("url")
+                if (url.isNullOrEmpty()) {
+                    result.error("INVALID_URL", "URL cannot be null or empty", null)
+                    return
+                }
+                result.success(CacheHolder.getCachedBytes(url))
+            }
+
+            "removeFromCache" -> {
+                val url = call.argument<String>("url")
+                if (url.isNullOrEmpty()) {
+                    result.error("INVALID_URL", "URL cannot be null or empty", null)
+                    return
+                }
+                val success = CacheHolder.removeResource(url)
+                result.success(success)
+            }
+            
+            "onAppPaused" -> {
+                pool?.onAppPaused()
+                result.success(null)
+            }
+            
+            "onAppResumed" -> {
+                pool?.onAppResumed()
+                result.success(null)
+            }
+            
+            "forceSurfaceRefresh" -> {
+                val index = (call.argument<Number>("index") ?: -1).toInt()
+                if (index < 0) {
+                    result.error("INVALID_INDEX", "Index must be >= 0", null)
+                    return
+                }
+                pool?.forceSurfaceRefresh(index)
+                result.success(null)
+            }
 
             else -> result.notImplemented()
         }

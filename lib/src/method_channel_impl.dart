@@ -73,43 +73,9 @@ class MethodChannelShorts extends ShortsPlatform {
 
   @override
   Stream<ShortsEvent> events() {
-    _cached ??= _ev.receiveBroadcastStream().map((e) {
-      final m = (e as Map).cast<String, Object?>();
-      final type = m['type'];
-      final idx = (m['index'] as num?)?.toInt() ?? -1;
-      switch (type) {
-        case 'ready':
-          return OnReady(idx);
-        case 'bufferingStart':
-          return OnBufferingStart(idx);
-        case 'bufferingEnd':
-          return OnBufferingEnd(idx);
-        case 'stall':
-          return OnStall(idx);
-        case 'error':
-          return OnError(idx, (m['message'] as String?) ?? 'error');
-        case 'firstFrame':
-          return FirstFrameEvent(idx);
-        case 'progress':
-          return OnProgress(
-            idx,
-            (m['posMs'] as num?)?.toInt() ?? 0,
-            (m['durMs'] as num?)?.toInt(),
-            (m['bufMs'] as num?)?.toInt(),
-          );
-        case 'metrics':
-          return MetricsEvent(
-            idx,
-            startupMs: (m['startupMs'] as num?)?.toInt(),
-            firstFrameMs: (m['firstFrameMs'] as num?)?.toInt(),
-            rebufferCount: (m['rebufferCount'] as num?)?.toInt() ?? 0,
-            rebufferDurationMs: (m['rebufferDurationMs'] as num?)?.toInt() ?? 0,
-            lastRebufferDurationMs: (m['lastRebufferDurationMs'] as num?)?.toInt(),
-          );
-        default:
-          return OnError(idx, 'unknown_event');
-      }
-    });
+    _cached ??= _ev
+        .receiveBroadcastStream()
+        .map((e) => parseShortsEvent(e as Map));
     return _cached!;
   }
 
@@ -168,4 +134,45 @@ class MethodChannelShorts extends ShortsPlatform {
     );
     return res?.map((k, v) => MapEntry(k.toString(), v));
   }
+
+  @override
+  Future<void> configureCacheSize({int? maxCacheSizeMb}) =>
+      _ch.invokeMethod('configureCacheSize', {
+        if (maxCacheSizeMb != null) 'maxCacheSizeMb': maxCacheSizeMb
+      });
+
+  @override
+  Future<String> getCacheState() async =>
+      (await _ch.invokeMethod<String>('getCacheState')) ?? 'UNINITIALIZED';
+
+  @override
+  Future<Map<String, dynamic>?> getCacheStats() async {
+    final res = await _ch.invokeMethod<Map<dynamic, dynamic>>('getCacheStats');
+    return res?.map((k, v) => MapEntry(k.toString(), v));
+  }
+
+  @override
+  Future<void> clearCache() => _ch.invokeMethod('clearCache');
+
+  @override
+  Future<bool> isCached(String url) async =>
+      (await _ch.invokeMethod<bool>('isCached', {'url': url})) ?? false;
+
+  @override
+  Future<int> getCachedBytes(String url) async =>
+      (await _ch.invokeMethod<int>('getCachedBytes', {'url': url})) ?? 0;
+
+  @override
+  Future<bool> removeFromCache(String url) async =>
+      (await _ch.invokeMethod<bool>('removeFromCache', {'url': url})) ?? false;
+  
+  @override
+  Future<void> onAppPaused() => _ch.invokeMethod('onAppPaused');
+  
+  @override
+  Future<void> onAppResumed() => _ch.invokeMethod('onAppResumed');
+  
+  @override
+  Future<void> forceSurfaceRefresh(int index) => 
+      _ch.invokeMethod('forceSurfaceRefresh', {'index': index});
 }

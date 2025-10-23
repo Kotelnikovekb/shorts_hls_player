@@ -36,9 +36,11 @@ class _ShortsViewState extends State<ShortsView> {
     _attaching = true;
     try {
       final id = await ShortsPlatform.instance.createView(widget.index);
-      await ShortsPlatform.instance.setCurrent(widget.index);
       if (!mounted) return;
       setState(() => _textureId = id);
+      try {
+        await ShortsPlatform.instance.forceSurfaceRefresh(widget.index);
+      } catch (_) {}
     } on PlatformException {
       if (!mounted) return;
       setState(() => _textureId = null);

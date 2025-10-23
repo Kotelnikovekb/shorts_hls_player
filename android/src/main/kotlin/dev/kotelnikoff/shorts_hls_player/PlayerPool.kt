@@ -7,6 +7,9 @@ import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.RectF
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
@@ -27,12 +30,12 @@ import dev.kotelnikoff.shorts_hls_player.cache.CacheHolder
 import dev.kotelnikoff.shorts_hls_player.cache.Prefetcher
 import dev.kotelnikoff.shorts_hls_player.playback.MediaFactories
 import java.io.ByteArrayOutputStream
-import java.util.LinkedHashMap
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.abs
 import java.util.Locale
+import java.util.Collections
 
 internal class PlayerPool(
     private val context: android.content.Context,
@@ -43,12 +46,13 @@ internal class PlayerPool(
     private val onBuffering: ((index: Int, isBuffering: Boolean) -> Unit)? = null,
     private val onFirstFrame: ((index: Int) -> Unit)? = null,
     private val onMetrics: ((index: Int, metrics: MetricsSnapshot) -> Unit)? = null,
+    private val onVideoSizeChanged: ((index: Int, width: Int, height: Int) -> Unit)? = null,
 ) {
 
     data class Config(
-        var maxActivePlayers: Int = 3,
-        var progressIntervalMsDefault: Long = 500L,
-        var prefetchBytesLimit: Long = 4L * 1024 * 1024
+        var maxActivePlayers: Int = 5,
+        var progressIntervalMsDefault: Long = 200L,
+        var prefetchBytesLimit: Long = 16L * 1024 * 1024
     )
     private val config: Config = initialConfig.copy()
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -56,16 +60,24 @@ internal class PlayerPool(
     private val dataSourceFactory = MediaFactories.dataSourceFactory(context, cache)
     private val mediaSourceFactory = MediaFactories.mediaSourceFactory(context, cache)
     private val prefetcher = Prefetcher(cache, dataSourceFactory, config.prefetchBytesLimit)
+    private val audioManager = context.getSystemService(android.content.Context.AUDIO_SERVICE) as AudioManager
+    private var audioFocusRequest: AudioFocusRequest? = null
 
-    /** accessOrder=true — свежие записи в конце */
-    private val entries: LinkedHashMap<Int, Entry> = LinkedHashMap(16, 0.75f, true)
-    private val surfacesByIndex = mutableMapOf<Int, Surface>()
-    /** просто реестр URL'ов, без создания плеера */
-    private val urls: MutableMap<Int, String> = mutableMapOf()
+    private val entries: MutableMap<Int, Entry> = Collections.synchronizedMap(LinkedHashMap(16, 0.75f, true))
+    private val surfacesByIndex: MutableMap<Int, Surface> = Collections.synchronizedMap(mutableMapOf())
+    private val urls: MutableMap<Int, String> = Collections.synchronizedMap(mutableMapOf())
+    
+    // Синхронизация для предотвращения race conditions при переключении видео
+    private val switchLock = Any()
 
     private val thumbnailCache: MutableMap<Int, ByteArray> = ConcurrentHashMap()
-    private val thumbnailExecutor: ExecutorService = Executors.newCachedThreadPool()
+    private val thumbnailExecutor: ExecutorService = Executors.newFixedThreadPool(2)
+    
+    // Кэш для оптимизации создания плееров
+    private val playerCache: MutableMap<String, ExoPlayer> = ConcurrentHashMap()
+    private val maxPlayerCacheSize = 3
 
+    @Volatile
     private var activeIndex: Int? = null
 
     companion object {
@@ -80,19 +92,40 @@ internal class PlayerPool(
         )
         private const val LUMA_THRESHOLD = 0.035f
         private const val MAX_LUMA_SAMPLES = 400
+        private const val LOW_MEMORY_THRESHOLD_MB = 50L
+
+        private fun isEmulator(): Boolean {
+            return (Build.FINGERPRINT.startsWith("generic")
+                    || Build.FINGERPRINT.startsWith("unknown")
+                    || Build.MODEL.contains("google_sdk")
+                    || Build.MODEL.contains("Emulator")
+                    || Build.MODEL.contains("Android SDK built for x86")
+                    || Build.MANUFACTURER.contains("Genymotion")
+                    || Build.BRAND.startsWith("generic") && Build.DEVICE.startsWith("generic")
+                    || "google_sdk" == Build.PRODUCT
+                    || Build.HARDWARE.contains("goldfish")
+                    || Build.HARDWARE.contains("ranchu"))
+        }
     }
 
-    // глобальные настройки
-    private var looping: Boolean = false
-    private var muted: Boolean = false
-    private var volume: Float = 1f
-    private var progressEnabled: Boolean = false
-    private var progressIntervalMs: Long = config.progressIntervalMsDefault
+    @Volatile private var looping: Boolean = false
+    @Volatile private var muted: Boolean = false
+    @Volatile private var volume: Float = 1f
+    @Volatile private var progressEnabled: Boolean = false
+    @Volatile private var progressIntervalMs: Long = config.progressIntervalMsDefault
 
-    // ограничения качества
-    private var qualityMaxHeight: Int? = null
-    private var qualityMaxWidth: Int? = null
-    private var qualityPeakBps: Int? = null
+    @Volatile private var qualityMaxHeight: Int? = null
+    @Volatile private var qualityMaxWidth: Int? = null
+    @Volatile private var qualityPeakBps: Int? = null
+    
+    // Метрики производительности
+    private var switchCount = 0
+    private var lastSwitchTime = 0L
+    private var averageSwitchTime = 0L
+    
+    // Состояние приложения
+    @Volatile private var isAppInForeground = true
+    @Volatile private var wasPlayingBeforeBackground = false
 
     private fun effectiveVolume(): Float = if (muted) 0f else volume
 
@@ -105,7 +138,8 @@ internal class PlayerPool(
         var progressRunnable: Runnable? = null,
         var firstFrameReported: Boolean = false,
         var isBuffering: Boolean = false,
-        val metrics: SessionMetrics = SessionMetrics()
+        val metrics: SessionMetrics = SessionMetrics(),
+        var playerListener: Player.Listener? = null  // Храним ссылку для cleanup
     )
 
     data class MetricsSnapshot(
@@ -204,17 +238,69 @@ internal class PlayerPool(
         newUrls.forEachIndexed { idx, url ->
             if (url.isNotEmpty()) urls[idx] = url
         }
+        
+        prewarmFirstElements()
     }
 
     private fun ensureEntry(index: Int): Entry? {
         val existing = entries[index]
-        if (existing != null) return existing
-        val url = urls[index] ?: return null
+        if (existing != null) {
+            Log.d(TAG, "ensureEntry: Using existing entry for index=$index")
+            return existing
+        }
 
-        val player = ExoPlayer.Builder(context)
-            .setLoadControl(createLoadControl())
-            .setMediaSourceFactory(mediaSourceFactory)
-            .build()
+        val url = urls[index]
+        if (url == null) {
+            Log.w(TAG, "ensureEntry: No URL for index=$index")
+            return null
+        }
+
+        Log.d(TAG, "ensureEntry: Creating new player for index=$index, url=$url")
+
+        val player = try {
+            val renderersFactory = androidx.media3.exoplayer.DefaultRenderersFactory(context).apply {
+                setEnableDecoderFallback(true)
+                setAllowedVideoJoiningTimeMs(1000)
+                setEnableAudioFloatOutput(false)
+
+                if (isEmulator()) {
+                    Log.w(TAG, "Emulator detected for index=$index, preferring software decoding")
+                    setExtensionRendererMode(androidx.media3.exoplayer.DefaultRenderersFactory.EXTENSION_RENDERER_MODE_PREFER)
+                } else {
+                    setExtensionRendererMode(androidx.media3.exoplayer.DefaultRenderersFactory.EXTENSION_RENDERER_MODE_ON)
+                }
+            }
+
+            ExoPlayer.Builder(context)
+                .setLoadControl(createLoadControl())
+                .setMediaSourceFactory(mediaSourceFactory)
+                .setSeekBackIncrementMs(5000)
+                .setSeekForwardIncrementMs(5000)
+                .setPriorityTaskManager(androidx.media3.common.PriorityTaskManager())
+                .setRenderersFactory(renderersFactory)
+                .build()
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to create ExoPlayer for index=$index", e)
+            return null
+        }
+
+        try {
+            player.videoScalingMode = androidx.media3.common.C.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING
+            player.playWhenReady = false
+            player.videoChangeFrameRateStrategy = androidx.media3.common.C.VIDEO_CHANGE_FRAME_RATE_STRATEGY_ONLY_IF_SEAMLESS
+            player.skipSilenceEnabled = false
+            player.setVideoScalingMode(androidx.media3.common.C.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING)
+            try {
+                player.setWakeMode(androidx.media3.common.C.WAKE_MODE_NETWORK)
+            } catch (e: SecurityException) {
+                Log.w(TAG, "WAKE_LOCK permission not granted, wake mode disabled for index=$index")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to configure ExoPlayer for index=$index", e)
+            runCatching { player.release() }
+            return null
+        }
+
         val e = Entry(player = player)
         entries[index] = e
 
@@ -224,22 +310,118 @@ internal class PlayerPool(
         applyQualityTo(e)
         e.player.setMediaItem(MediaItem.fromUri(url))
         prefetcher.prefetch(url)
+        
+        if (index < 3 && !thumbnailCache.containsKey(index)) {
+            getThumbnail(index) { _ -> }
+        }
 
-        // если Surface уже зарегистрирован — повесим сразу
-        surfacesByIndex[index]?.let { e.player.setVideoSurface(it) }
+        // если Surface уже зарегистрирован — повесим сразу синхронно
+        surfacesByIndex[index]?.let { surface ->
+            if (surface.isValid) {
+                try {
+                    e.player.clearVideoSurface()
+                    e.player.setVideoSurface(surface)
+                    Log.d(TAG, "ensureEntry: Surface attached for index=$index")
+                } catch (ex: Exception) {
+                    Log.w(TAG, "Failed to set surface for index=$index", ex)
+                    surfacesByIndex.remove(index)
+                }
+            } else {
+                Log.w(TAG, "ensureEntry: Surface invalid for index=$index, removing")
+                surfacesByIndex.remove(index)
+            }
+        }
 
+        Log.d(TAG, "ensureEntry: Player created successfully for index=$index")
         return e
     }
 
     fun registerSurface(index: Int, surface: Surface) {
-        val old = surfacesByIndex[index]
-        if (old != null && old !== surface) {
-            runCatching { entries[index]?.player?.clearVideoSurface() }
+        synchronized(surfacesByIndex) {
+            if (!surface.isValid) {
+                Log.w(TAG, "registerSurface: Invalid surface for index=$index")
+                return
+            }
+
+            Log.d(TAG, "registerSurface: Registering surface for index=$index")
+
+            val old = surfacesByIndex[index]
+            if (old != null && old !== surface) {
+                Log.d(TAG, "registerSurface: Clearing old surface for index=$index")
+                runCatching {
+                    entries[index]?.player?.clearVideoSurface()
+                }
+            }
+            surfacesByIndex[index] = surface
+
+            // Предварительная проверка Surface перед использованием
+            if (!isSurfaceUsable(surface)) {
+                Log.w(TAG, "registerSurface: Surface not usable for index=$index")
+                surfacesByIndex.remove(index)
+                return
+            }
+
+            drawThumbnailIntoSurface(index, surface)
+
+            entries[index]?.let { entry ->
+                if (!surface.isValid) {
+                    Log.w(TAG, "registerSurface: Surface became invalid for index=$index")
+                    surfacesByIndex.remove(index)
+                    return@synchronized
+                }
+
+                // Синхронно устанавливаем Surface
+                runCatching {
+                    entry.player.clearVideoSurface()
+                    entry.player.setVideoSurface(surface)
+                    Log.d(TAG, "registerSurface: Surface set for index=$index")
+                    if (entry.prepared && entry.player.playbackState != Player.STATE_IDLE) {
+                        Log.d(TAG, "registerSurface: Player already prepared for index=$index, state=${entry.player.playbackState}")
+                    } else if (!entry.prepared) {
+                        Log.d(TAG, "registerSurface: Preparing player for index=$index")
+                        entry.player.prepare()
+                        entry.prepared = true
+                    }
+                }.onFailure { ex ->
+                    Log.e(TAG, "registerSurface: Failed to set surface for index=$index", ex)
+                    synchronized(surfacesByIndex) {
+                        surfacesByIndex.remove(index)
+                    }
+                }
+            } ?: run {
+                Log.d(TAG, "registerSurface: No player entry yet for index=$index, surface registered for later use")
+            }
         }
-        surfacesByIndex[index] = surface
-        // Попробуем отрисовать превью-кадр (если есть) прямо в Surface — чтобы не было чёрного экрана
-        drawThumbnailIntoSurface(index, surface)
-        entries[index]?.player?.setVideoSurface(surface)
+    }
+    
+    private fun isSurfaceUsable(surface: Surface): Boolean {
+        return try {
+            surface.isValid
+        } catch (e: Exception) {
+            Log.w(TAG, "Surface validation failed", e)
+            false
+        }
+    }
+    
+    private fun ensureSurfaceAttached(index: Int, entry: Entry) {
+        val surface = synchronized(surfacesByIndex) {
+            surfacesByIndex[index]?.takeIf { it.isValid }
+        }
+        
+        if (surface != null) {
+            try {
+                Log.d(TAG, "ensureSurfaceAttached: Reattaching surface for index=$index")
+                entry.player.clearVideoSurface()
+                entry.player.setVideoSurface(surface)
+            } catch (e: Exception) {
+                Log.e(TAG, "ensureSurfaceAttached: Failed to attach surface for index=$index", e)
+                synchronized(surfacesByIndex) {
+                    surfacesByIndex.remove(index)
+                }
+            }
+        } else {
+            Log.w(TAG, "ensureSurfaceAttached: No valid surface for index=$index")
+        }
     }
 
     // ---------------- PRIME / SWITCH ----------------
@@ -257,24 +439,95 @@ internal class PlayerPool(
     fun prewarm(next: Int?, prev: Int?) {
         next?.let { if (urls.containsKey(it)) prime(it) }
         prev?.let { if (urls.containsKey(it)) prime(it) }
+        
+        val current = activeIndex
+        if (current != null) {
+            val nextNext = current + 1
+            val prevPrev = current - 1
+            if (urls.containsKey(nextNext)) prime(nextNext)
+            if (urls.containsKey(prevPrev)) prime(prevPrev)
+        }
+        
         activeIndex?.let { enforcePoolBudget(it) }
+    }
+    
+    fun prewarmFirstElements() {
+        val prefetchCount = minOf(3, urls.size)
+        for (i in 0 until prefetchCount) {
+            if (!entries.containsKey(i)) {
+                prime(i)
+            }
+        }
     }
 
     fun switchTo(index: Int) {
-        val e = ensureEntry(index) ?: return
-        val url = urls[index]
-        if (!e.prepared) prime(index)
+        val startTime = nowMs()
+        synchronized(switchLock) {
+            val e = ensureEntry(index)
+        if (e == null) {
+            Log.e(TAG, "switchTo: Failed to ensure entry for index=$index")
+            return
+        }
 
-        surfacesByIndex[index]?.let { surface ->
-            e.player.setVideoSurface(surface)
+        val url = urls[index]
+        if (url.isNullOrEmpty()) {
+            Log.e(TAG, "switchTo: No URL for index=$index")
+            return
         }
 
         val prevIdx = activeIndex
         val prev = prevIdx?.let { entries[it] }
+        
         if (prev != null && prev !== e) {
-            prev.player.pause()
-            prev.player.playWhenReady = false
-            cancelProgressWatcher(prev)
+            runCatching {
+                Log.d(TAG, "switchTo: Stopping previous player at index=$prevIdx")
+                cancelProgressWatcher(prev)
+                prev?.player?.pause()
+                prev?.player?.playWhenReady = false
+                prev?.player?.clearVideoSurface()
+            }.onFailure { ex ->
+                Log.e(TAG, "switchTo: Error stopping previous player at index=$prevIdx", ex)
+            }
+        }
+
+        if (!e.prepared) {
+            try {
+                e.player.prepare()
+                e.prepared = true
+            } catch (ex: Exception) {
+                Log.e(TAG, "switchTo: Failed to prepare player for index=$index", ex)
+                return
+            }
+        } else {
+            e.player.seekTo(0)
+        }
+
+        // Получаем Surface синхронно
+        val surface = synchronized(surfacesByIndex) {
+            surfacesByIndex[index]?.takeIf { it.isValid }
+        }
+
+        if (surface != null) {
+            // Синхронно устанавливаем Surface
+            runCatching {
+                e.player.clearVideoSurface()
+                e.player.setVideoSurface(surface)
+                Log.d(TAG, "switchTo: Surface attached for index=$index")
+            }.onFailure { ex ->
+                Log.e(TAG, "switchTo: Failed to set surface for index=$index", ex)
+                synchronized(surfacesByIndex) {
+                    surfacesByIndex.remove(index)
+                }
+            }
+        } else {
+            synchronized(surfacesByIndex) {
+                if (surfacesByIndex[index] != null) {
+                    Log.w(TAG, "switchTo: Surface invalid for index=$index, removing")
+                    surfacesByIndex.remove(index)
+                } else {
+                    Log.w(TAG, "switchTo: No surface for index=$index - will wait for registerSurface")
+                }
+            }
         }
 
         e.metrics.start(nowMs())
@@ -284,12 +537,14 @@ internal class PlayerPool(
 
         applyVolume(e)
         applyLooping(e)
-        url?.let { prefetcher.prefetch(it) }
+        prefetcher.prefetch(url)
 
-        e.player.playWhenReady = false
-        e.player.pause()
+        e.player.playWhenReady = true
         cancelProgressWatcher(e)
         activeIndex = index
+        
+        // Убеждаемся что Surface привязан
+        ensureSurfaceAttached(index, e)
 
         when (e.player.playbackState) {
             Player.STATE_READY -> {
@@ -316,33 +571,169 @@ internal class PlayerPool(
         }
 
         enforcePoolBudget(index)
+        enforceWindowBudget(index)
+        
+        prewarm(index + 1, index - 1)
+        
+        // Обновляем метрики производительности
+        val switchTime = nowMs() - startTime
+        switchCount++
+        averageSwitchTime = (averageSwitchTime * (switchCount - 1) + switchTime) / switchCount
+        lastSwitchTime = switchTime
+        
+        if (switchTime > 100) {
+            Log.w(TAG, "Slow switch detected: ${switchTime}ms for index=$index")
+        }
+        }
     }
 
     // ---------------- PLAYBACK ----------------
 
-    fun play() { activeIndex?.let { entries[it]?.player?.play() } }
+    fun play() {
+        requestAudioFocus()
+        val idx = activeIndex
+        if (idx == null) {
+            Log.w(TAG, "play: No active index set")
+            return
+        }
+        val e = entries[idx]
+        if (e == null) {
+            Log.w(TAG, "play: No entry for activeIndex=$idx")
+            return
+        }
+
+        runCatching {
+            e.player.playWhenReady = true
+            e.player.play()
+            scheduleProgressWatcher(idx, e)
+            Log.d(TAG, "play: Started playback for activeIndex=$idx, state=${e.player.playbackState}")
+        }.onFailure { ex ->
+            Log.e(TAG, "play: Failed to start playback for activeIndex=$idx", ex)
+        }
+    }
     fun play(index: Int) {
-        val e = ensureEntry(index) ?: return
+        synchronized(switchLock) {
+            requestAudioFocus()
+            val e = ensureEntry(index)
+        if (e == null) {
+            Log.e(TAG, "play: Failed to ensure entry for index=$index")
+            return
+        }
+
+        // Останавливаем предыдущий активный плеер если он отличается
+        val prevIdx = activeIndex
+        val prev = prevIdx?.let { entries[it] }
+        if (prev != null && prev !== e) {
+            runCatching {
+                Log.d(TAG, "play: Stopping previous player at index=$prevIdx")
+                cancelProgressWatcher(prev)
+                prev?.player?.pause()
+                prev?.player?.playWhenReady = false
+                prev?.player?.clearVideoSurface()
+            }.onFailure { ex ->
+                Log.e(TAG, "play: Error stopping previous player at index=$prevIdx", ex)
+            }
+        }
+
+        val surface = synchronized(surfacesByIndex) {
+            surfacesByIndex[index]?.takeIf { it.isValid }
+        }
+
+        if (surface != null) {
+            // Синхронно устанавливаем Surface
+            runCatching {
+                e.player.clearVideoSurface()
+                e.player.setVideoSurface(surface)
+                Log.d(TAG, "play: Surface attached for index=$index")
+            }.onFailure { ex ->
+                Log.e(TAG, "play: Failed to attach surface for index=$index", ex)
+                synchronized(surfacesByIndex) {
+                    surfacesByIndex.remove(index)
+                }
+            }
+        } else {
+            synchronized(surfacesByIndex) {
+                if (surfacesByIndex[index] != null) {
+                    Log.w(TAG, "play: Surface invalid for index=$index, removing")
+                    surfacesByIndex.remove(index)
+                } else {
+                    Log.w(TAG, "play: No surface for index=$index - video may not render!")
+                }
+            }
+        }
+
+        if (!e.prepared) {
+            try {
+                e.player.prepare()
+                e.prepared = true
+            } catch (ex: Exception) {
+                Log.e(TAG, "play: Failed to prepare player for index=$index", ex)
+                return
+            }
+        }
+
         activeIndex = index
-        e.player.playWhenReady = true
-        e.player.play()
-        scheduleProgressWatcher(index, e)
+        ensureSurfaceAttached(index, e)
+        runCatching {
+            e.player.playWhenReady = true
+            e.player.play()
+            scheduleProgressWatcher(index, e)
+        }.onFailure { ex ->
+            Log.e(TAG, "switchTo: Failed to start playback for index=$index", ex)
+        }
+        prewarm(index + 1, index - 1)
+        }
+    }
+
+    private fun requestAudioFocus() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            if (audioFocusRequest == null) {
+                audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                            .build()
+                    )
+                    .build()
+            }
+            audioManager.requestAudioFocus(audioFocusRequest!!)
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.requestAudioFocus(
+                null,
+                AudioManager.STREAM_MUSIC,
+                AudioManager.AUDIOFOCUS_GAIN
+            )
+        }
+    }
+
+    private fun abandonAudioFocus() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            audioFocusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.abandonAudioFocus(null)
+        }
     }
 
     fun pause() {
+        abandonAudioFocus()
         val idx = activeIndex ?: return
         val e = entries[idx] ?: return
         e.player.pause()
+        e.player.playWhenReady = false
         cancelProgressWatcher(e)
+        Log.d(TAG, "pause: Paused active player at index=$idx")
     }
 
     fun pause(index: Int) {
+        abandonAudioFocus()
         val e = entries[index] ?: return
         e.player.pause()
+        e.player.playWhenReady = false
         cancelProgressWatcher(e)
-        if (activeIndex == index) {
-            activeIndex = null
-        }
+        Log.d(TAG, "pause: Paused player at index=$index")
     }
 
     fun togglePlayPause() {
@@ -426,39 +817,113 @@ internal class PlayerPool(
             "pixelWidthHeightRatio" to vs.pixelWidthHeightRatio
         )
     }
+    
+    fun getPerformanceMetrics(): Map<String, Any> {
+        val availableMemoryMB = getAvailableMemoryMB()
+        return mapOf(
+            "switchCount" to switchCount,
+            "lastSwitchTime" to lastSwitchTime,
+            "averageSwitchTime" to averageSwitchTime,
+            "activePlayers" to entries.size,
+            "thumbnailCacheSize" to thumbnailCache.size,
+            "availableMemoryMB" to availableMemoryMB,
+            "isLowMemory" to (availableMemoryMB < LOW_MEMORY_THRESHOLD_MB)
+        )
+    }
+    
+    fun forceSurfaceRefresh(index: Int) {
+        val entry = entries[index] ?: return
+        Log.d(TAG, "forceSurfaceRefresh: Refreshing surface for index=$index")
+        ensureSurfaceAttached(index, entry)
+    }
+    
+    fun onAppPaused() {
+        Log.d(TAG, "onAppPaused: App went to background")
+        isAppInForeground = false
+        wasPlayingBeforeBackground = activeIndex?.let { entries[it]?.player?.isPlaying } ?: false
+        
+        if (wasPlayingBeforeBackground) {
+            Log.d(TAG, "onAppPaused: Pausing playback due to background")
+            pause()
+        }
+    }
+    
+    fun onAppResumed() {
+        Log.d(TAG, "onAppResumed: App came to foreground")
+        isAppInForeground = true
+        
+        if (wasPlayingBeforeBackground) {
+            Log.d(TAG, "onAppResumed: Resuming playback")
+            play()
+        }
+    }
 
     // ---------------- DISPOSE / RELEASE ----------------
 
     fun disposeIndex(index: Int) {
         val e = entries.remove(index) ?: return
         cancelProgressWatcher(e)
-        runCatching { e.player.clearVideoSurface() }
-        runCatching { e.player.release() }
-        surfacesByIndex.remove(index)?.let { runCatching { it.release() } }
+        runCatching {
+            e.playerListener?.let { e.player.removeListener(it) }
+            e.player.stop()
+            e.player.clearVideoSurface()
+            e.player.clearMediaItems()
+            e.player.release()
+        }.onFailure { ex ->
+            Log.e(TAG, "disposeIndex: Error disposing player at index=$index", ex)
+        }
+        surfacesByIndex.remove(index)
         if (activeIndex == index) activeIndex = null
         thumbnailCache.remove(index)
+        Log.d(TAG, "disposeIndex: Disposed player at index=$index")
     }
 
     fun release() {
-        entries.values.forEach { e ->
-            cancelProgressWatcher(e)
-            runCatching { e.player.clearVideoSurface() }
-            runCatching { e.player.release() }
+        abandonAudioFocus()
+
+        synchronized(entries) {
+            entries.values.forEach { e ->
+                cancelProgressWatcher(e)
+                runCatching {
+                    e.playerListener?.let { e.player.removeListener(it) }
+                    e.player.stop()
+                    e.player.clearVideoSurface()
+                    e.player.clearMediaItems()
+                    e.player.release()
+                }.onFailure { ex ->
+                    Log.e(TAG, "release: Error releasing player", ex)
+                }
+            }
+            entries.clear()
         }
-        entries.clear()
-        surfacesByIndex.values.forEach { runCatching { it.release() } }
-        surfacesByIndex.clear()
+
+        synchronized(surfacesByIndex) {
+            surfacesByIndex.clear()
+        }
         activeIndex = null
         thumbnailCache.clear()
-        prefetcher.shutdown()
-        thumbnailExecutor.shutdownNow()
+
+        runCatching {
+            prefetcher.shutdown()
+        }.onFailure { ex ->
+            Log.e(TAG, "release: Error shutting down prefetcher", ex)
+        }
+
+        runCatching {
+            thumbnailExecutor.shutdownNow()
+        }.onFailure { ex ->
+            Log.e(TAG, "release: Error shutting down thumbnail executor", ex)
+        }
+
+        Log.d(TAG, "PlayerPool released")
     }
 
     // ---------------- INTERNAL ----------------
 
     private fun ensureListener(index: Int, e: Entry) {
         if (e.listenerAdded) return
-        e.player.addListener(object : Player.Listener {
+
+        val listener = object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
                 val now = nowMs()
                 when (state) {
@@ -501,7 +966,13 @@ internal class PlayerPool(
             }
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 if (activeIndex == index) {
-                    if (isPlaying) scheduleProgressWatcher(index, e) else cancelProgressWatcher(e)
+                    if (isPlaying) {
+                        scheduleProgressWatcher(index, e)
+                        // Проверяем Surface при начале воспроизведения
+                        ensureSurfaceAttached(index, e)
+                    } else {
+                        cancelProgressWatcher(e)
+                    }
                 }
             }
             override fun onRenderedFirstFrame() {
@@ -511,11 +982,71 @@ internal class PlayerPool(
                 if (!e.firstFrameReported) {
                     e.firstFrameReported = true
                     onFirstFrame?.invoke(index)
+                    Log.d(TAG, "First frame rendered for index=$index")
                 }
                 reportMetrics(index, e.metrics)
                 captureSnapshotForCache(index, e)
             }
-        })
+            
+            override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
+                Log.d(TAG, "Video size changed for index=$index: ${videoSize.width}x${videoSize.height}")
+                try {
+                    if (videoSize.width > 0 && videoSize.height > 0) {
+                        onVideoSizeChanged?.invoke(index, videoSize.width, videoSize.height)
+                    }
+                } catch (_: Throwable) {}
+                if (activeIndex == index) {
+                    ensureSurfaceAttached(index, e)
+                }
+            }
+
+            override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                Log.e(TAG, "Player error at index=$index: ${error.message}", error)
+                e.metrics.markBufferEnd(nowMs())
+                if (e.isBuffering) {
+                    e.isBuffering = false
+                    onBuffering?.invoke(index, false)
+                }
+
+                val isDecoderError = error.errorCode == androidx.media3.common.PlaybackException.ERROR_CODE_DECODER_INIT_FAILED ||
+                                     error.errorCode == androidx.media3.common.PlaybackException.ERROR_CODE_DECODING_FAILED ||
+                                     error is androidx.media3.exoplayer.mediacodec.MediaCodecDecoderException
+
+                when {
+                    isDecoderError -> {
+                        Log.w(TAG, "Decoder error at index=$index, attempting recovery...")
+                        mainHandler.postDelayed({
+                            runCatching {
+                                val currentPos = e.player.currentPosition
+                                e.player.stop()
+                                e.player.prepare()
+                                e.player.seekTo(currentPos)
+                                if (activeIndex == index) {
+                                    e.player.playWhenReady = true
+                                    e.player.play()
+                                }
+                                Log.d(TAG, "Decoder recovery attempted for index=$index")
+                            }.onFailure { ex ->
+                                Log.e(TAG, "Decoder recovery failed for index=$index", ex)
+                                disposeIndex(index)
+                            }
+                        }, 500)
+                    }
+                    error.errorCode == androidx.media3.common.PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW ||
+                    error.errorCode == androidx.media3.common.PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED ||
+                    error.errorCode == androidx.media3.common.PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT -> {
+                        Log.w(TAG, "Network error at index=$index, will retry")
+                    }
+                    else -> {
+                        Log.e(TAG, "Fatal error at index=$index, disposing player")
+                        mainHandler.post { disposeIndex(index) }
+                    }
+                }
+            }
+        }
+
+        e.player.addListener(listener)
+        e.playerListener = listener
         e.listenerAdded = true
     }
 
@@ -548,7 +1079,9 @@ internal class PlayerPool(
     private fun captureSnapshotForCache(index: Int, entry: Entry) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         if (thumbnailCache.containsKey(index)) return
-        val surface = surfacesByIndex[index] ?: return
+        val surface = synchronized(surfacesByIndex) {
+            surfacesByIndex[index]?.takeIf { it.isValid }
+        } ?: return
         val vs = entry.player.videoSize
         val width = if (vs.width > 0) vs.width else 360
         val height = if (vs.height > 0) vs.height else 640
@@ -570,6 +1103,7 @@ internal class PlayerPool(
                 }
             }, mainHandler)
         } catch (t: Throwable) {
+            Log.w(TAG, "Failed to capture snapshot for index=$index", t)
             bitmap.recycle()
         }
     }
@@ -633,14 +1167,56 @@ internal class PlayerPool(
 
     /** держим не больше N «живых» плееров; выбрасываем самых дальних от anchorIndex */
     private fun enforcePoolBudget(anchorIndex: Int) {
-        val limit = config.maxActivePlayers.coerceAtLeast(1)
-        if (entries.size <= limit) return
-        val candidates: MutableList<Int> = entries.keys.filter { it != anchorIndex }.toMutableList()
+        val availableMemoryMB = getAvailableMemoryMB()
+        val effectiveLimit = if (availableMemoryMB < LOW_MEMORY_THRESHOLD_MB) {
+            Log.w(TAG, "Low memory: ${availableMemoryMB}MB, reducing pool size")
+            thumbnailCache.clear()
+            System.gc()
+            1
+        } else {
+            config.maxActivePlayers.coerceAtLeast(1)
+        }
+
+        if (entries.size <= effectiveLimit) return
+
+        val candidates: MutableList<Int> = synchronized(entries) {
+            entries.keys.filter { it != anchorIndex }.toMutableList()
+        }
+
         candidates.sortByDescending { distance(anchorIndex, it) }
-        while (entries.size > limit && candidates.isNotEmpty()) {
+        while (entries.size > effectiveLimit && candidates.isNotEmpty()) {
             val victim = candidates.removeAt(0)
             disposeIndex(victim)
         }
+    }
+    
+    /** Ограничиваем окно плееров как в iOS - только активный + соседи в радиусе 2 */
+    private fun enforceWindowBudget(anchorIndex: Int) {
+        val toDispose = entries.keys.filter { abs(it - anchorIndex) > 2 }
+        toDispose.forEach { disposeIndex(it) }
+    }
+
+    private fun getAvailableMemoryMB(): Long {
+        val runtime = Runtime.getRuntime()
+        val maxMemory = runtime.maxMemory()
+        val totalMemory = runtime.totalMemory()
+        val freeMemory = runtime.freeMemory()
+        val availableMemory = maxMemory - (totalMemory - freeMemory)
+        val availableMB = availableMemory / (1024 * 1024)
+        
+        // Автоматическая очистка кэша при критической нехватке памяти
+        if (availableMB < LOW_MEMORY_THRESHOLD_MB / 2) {
+            Log.w(TAG, "Critical memory: ${availableMB}MB, clearing caches")
+            clearCaches()
+        }
+        
+        return availableMB
+    }
+    
+    private fun clearCaches() {
+        thumbnailCache.clear()
+        playerCache.clear()
+        System.gc()
     }
 
     private fun distance(a: Int, b: Int): Int = abs(a - b)
@@ -657,6 +1233,37 @@ internal class PlayerPool(
             return
         }
 
+        if (index < 3) {
+            generateThumbnailSync(index, callback)
+        } else {
+            thumbnailExecutor.execute {
+                val data = runCatching {
+                    val retriever = MediaMetadataRetriever()
+                    try {
+                        retriever.setDataSource(context, Uri.parse(url))
+                        extractMeaningfulThumbnail(index, retriever)
+                    } finally {
+                        retriever.release()
+                    }
+                }.getOrNull()
+
+                if (data != null) {
+                    thumbnailCache[index] = data
+                    synchronized(surfacesByIndex) {
+                        surfacesByIndex[index]?.takeIf { it.isValid }?.let { s ->
+                            drawThumbnailIntoSurface(index, s)
+                        }
+                    }
+                } else {
+                    Log.w(TAG, "Thumbnail extraction failed for index=$index url=$url")
+                }
+                mainHandler.post { callback(data) }
+            }
+        }
+    }
+    
+    private fun generateThumbnailSync(index: Int, callback: (ByteArray?) -> Unit) {
+        val url = urls[index] ?: return
         thumbnailExecutor.execute {
             val data = runCatching {
                 val retriever = MediaMetadataRetriever()
@@ -670,12 +1277,11 @@ internal class PlayerPool(
 
             if (data != null) {
                 thumbnailCache[index] = data
-                // Если уже есть Surface — отрисуем превью (до первого кадра видео)
-                surfacesByIndex[index]?.let { s ->
-                    drawThumbnailIntoSurface(index, s)
+                synchronized(surfacesByIndex) {
+                    surfacesByIndex[index]?.takeIf { it.isValid }?.let { s ->
+                        drawThumbnailIntoSurface(index, s)
+                    }
                 }
-            } else {
-                Log.w(TAG, "Thumbnail extraction failed for index=$index url=$url")
             }
             mainHandler.post { callback(data) }
         }
@@ -735,8 +1341,15 @@ internal class PlayerPool(
 
     private fun compressBitmap(bmp: Bitmap): ByteArray? {
         return runCatching {
+            val format = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                Bitmap.CompressFormat.WEBP_LOSSY
+            } else {
+                @Suppress("DEPRECATION")
+                Bitmap.CompressFormat.WEBP
+            }
+
             ByteArrayOutputStream().use { baos ->
-                bmp.compress(Bitmap.CompressFormat.JPEG, 85, baos)
+                bmp.compress(format, 90, baos)
                 baos.toByteArray()
             }
         }.getOrNull()
@@ -775,19 +1388,22 @@ internal class PlayerPool(
      * Масштабирование по принципу centerCrop (аналог BoxFit.cover / resizeAspectFill).
      */
     private fun drawThumbnailIntoSurface(index: Int, surface: Surface) {
+        if (!surface.isValid) return
         val bytes = thumbnailCache[index] ?: return
         val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return
         runCatching {
+            if (!surface.isValid) {
+                bmp.recycle()
+                return
+            }
             val canvas: Canvas = surface.lockCanvas(null)
             try {
-                // Зальём фон чёрным
                 canvas.drawColor(Color.BLACK)
 
                 val dst = RectF(0f, 0f, canvas.width.toFloat(), canvas.height.toFloat())
                 val src = RectF(0f, 0f, bmp.width.toFloat(), bmp.height.toFloat())
 
                 val m = Matrix()
-                // Рассчитываем масштаб для покрытия (centerCrop)
                 val scale = maxOf(dst.width() / src.width(), dst.height() / src.height())
                 val scaledW = src.width() * scale
                 val scaledH = src.height() * scale
@@ -801,15 +1417,26 @@ internal class PlayerPool(
             } finally {
                 surface.unlockCanvasAndPost(canvas)
             }
-        }.onFailure {
-            // игнорируем — ничего страшного, просто останется чёрный экран до первого кадра
+            bmp.recycle()
+        }.onFailure { ex ->
+            Log.w(TAG, "Failed to draw thumbnail for index=$index", ex)
+            bmp.recycle()
         }
     }
 
-    private fun createLoadControl(): LoadControl =
-        DefaultLoadControl.Builder()
-            .setBufferDurationsMs(1500, 6000, 500, 500)
-            .setBackBuffer(1500, true)
+    private fun createLoadControl(): LoadControl {
+        val availableMemoryMB = getAvailableMemoryMB()
+        val (minBuffer, maxBuffer, playbackBuffer, rebuffer) = if (availableMemoryMB < LOW_MEMORY_THRESHOLD_MB) {
+            listOf(500, 2000, 300, 300)
+        } else {
+            listOf(200, 1000, 150, 150)
+        }
+
+        return DefaultLoadControl.Builder()
+            .setBufferDurationsMs(minBuffer, maxBuffer, playbackBuffer, rebuffer)
+            .setBackBuffer(500, true)
+            .setTargetBufferBytes(DefaultLoadControl.DEFAULT_TARGET_BUFFER_BYTES)
             .setPrioritizeTimeOverSizeThresholds(true)
             .build()
+    }
 }

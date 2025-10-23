@@ -131,8 +131,13 @@ public class SwiftShortsHlsPlayerPlugin: NSObject, FlutterPlugin, FlutterStreamH
       result(pool.getMeta(index: idx))
 
     case "createView":
-      // Для UiKitView сам view создаёт фабрика, тут можно вернуть любой int.
       result(0)
+
+    case "getPlaybackInfo":
+      let idx = (call.arguments as? [String: Any])?["index"] as? Int ?? -1
+      let info = pool.getPlaybackInfo(index: idx)
+      result(info)
+
     case "togglePlayPause":
           let idx = (call.arguments as? [String: Any])?["index"] as? Int ?? -1
           pool.togglePlayPause(index: idx); result(nil)

@@ -43,6 +43,11 @@ class ShortsController with ChangeNotifier {
 
   final Map<int, VideoMeta> _meta = {};
   final Map<int, Future<VideoMeta>> _metaFutures = {};
+  final Map<int, bool> _prewarmCancels = {};
+  StreamSubscription<ShortsEvent>? _platformEventsSub;
+  
+  // Обработка жизненного цикла приложения
+  bool _isAppInForeground = true;
 
   VideoMeta? getMeta(int index) => _meta[index];
 
@@ -54,7 +59,6 @@ class ShortsController with ChangeNotifier {
 
   bool get looping => _looping;
 
-  bool muted = false;
   ShortsQuality qualityPreset = ShortsQuality.auto;
   bool progressEnabled = false;
   Duration progressInterval = const Duration(milliseconds: 500);
@@ -68,15 +72,15 @@ class ShortsController with ChangeNotifier {
   Future<void> init() async {
     if (_initialized) return;
 
-    _p.events().listen(_eventsCtrl.add);
+    _platformEventsSub = _p.events().listen(_eventsCtrl.add);
     _attachMethodHandlerIfNeeded();
 
     // единый «толстый» init с конфигом
     await _p.init(
       config: ShortsInitConfig(
-        looping: looping,
-        muted: muted,
-        volume: volume,
+        looping: _looping,
+        muted: _isMuted,
+        volume: _volume,
         quality: qualityPreset,
         progressEnabled: progressEnabled,
         progressInterval: progressInterval,
@@ -237,8 +241,10 @@ class ShortsController with ChangeNotifier {
     int backward = 1,
   }) async {
     // helper: безопасно вызвать prime, игнорируя невалидные индексы/ошибки
+    _prewarmCancels[index] = false;
+
     Future<void> safePrime(int i) async {
-      if (i < 0) {
+      if (i < 0 || _prewarmCancels[index] == true) {
         return; // НЕ шлём отрицательные индексы -> не ловим INVALID_INDEX
       }
       try {
@@ -250,8 +256,11 @@ class ShortsController with ChangeNotifier {
       }
     }
 
+
     // текущий
     await safePrime(index);
+    if (_prewarmCancels[index] == true) return;
+
 
     // вперёд
     final futures = <Future<void>>[];
@@ -266,6 +275,11 @@ class ShortsController with ChangeNotifier {
     }
 
     await Future.wait(futures);
+    _prewarmCancels.remove(index);
+  }
+
+  void cancelPrewarm(int index) {
+    _prewarmCancels[index] = true;
   }
 
   Future<void> onActive(int index, {bool autoPlay = true}) async {
@@ -334,14 +348,61 @@ class ShortsController with ChangeNotifier {
         enabled: enabled, intervalMs: interval?.inMilliseconds);
   }
 
+  VideoPerformanceMetrics? getPerformanceMetrics(int index) {
+    final state = overlayOf(index);
+    if (state.startupMs < 0 && state.firstFrameMs < 0) return null;
+
+    return VideoPerformanceMetrics(
+      startupMs: state.startupMs >= 0 ? state.startupMs : 0,
+      firstFrameMs: state.firstFrameMs >= 0 ? state.firstFrameMs : 0,
+      rebufferCount: state.rebufferCount,
+      totalRebufferMs: state.rebufferDurationMs,
+    );
+  }
+
+  Future<void> configureCacheSize({int? maxCacheSizeMb}) =>
+      _p.configureCacheSize(maxCacheSizeMb: maxCacheSizeMb);
+
+  Future<String> getCacheState() => _p.getCacheState();
+
+  Future<Map<String, dynamic>?> getCacheStats() => _p.getCacheStats();
+
+  Future<void> clearCache() => _p.clearCache();
+
+  Future<bool> isCached(String url) => _p.isCached(url);
+
+  Future<int> getCachedBytes(String url) => _p.getCachedBytes(url);
+
+  Future<bool> removeFromCache(String url) => _p.removeFromCache(url);
+
   bool _methodHandlerAttached = false;
 
   @override
   void dispose() {
+    _platformEventsSub?.cancel();
     _evSub?.cancel();
     _evSub = null;
     _eventsCtrl.close();
     super.dispose();
+  }
+  
+  /// Вызывается когда приложение переходит в фоновый режим
+  void onAppPaused() {
+    if (!_isAppInForeground) return;
+    _isAppInForeground = false;
+    _p.onAppPaused();
+  }
+  
+  /// Вызывается когда приложение возвращается на передний план
+  void onAppResumed() {
+    if (_isAppInForeground) return;
+    _isAppInForeground = true;
+    _p.onAppResumed();
+  }
+  
+  /// Принудительное обновление Surface для указанного индекса
+  void forceSurfaceRefresh(int index) {
+    _p.forceSurfaceRefresh(index);
   }
 
   void _attachMethodHandlerIfNeeded() {

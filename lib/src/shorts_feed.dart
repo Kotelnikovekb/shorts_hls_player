@@ -246,12 +246,16 @@ class _ShortsFeedState extends State<ShortsFeed> {
   void _schedulePrefetch(int index) {
     if (!_isValidIndex(index)) return;
 
-    // Параллельная загрузка для мгновенного отклика
     final futures = <Future>[];
     
     void queue(int idx) {
       if (_isValidIndex(idx)) {
-        futures.add(_ctrl.ensureMetadata(idx));
+        futures.add(
+          _ctrl.ensureMetadata(idx).timeout(
+            const Duration(seconds: 3),
+            onTimeout: () => VideoMeta(width: 720, height: 1280, durationMs: -1),
+          ),
+        );
       }
     }
 
@@ -259,7 +263,6 @@ class _ShortsFeedState extends State<ShortsFeed> {
     queue(index + 1);
     queue(index - 1);
     
-    // Параллельно загружаем метаданные и превью
     unawaited(Future.wait(futures));
     _ensureThumb(index);
   }
@@ -326,6 +329,14 @@ class _ShortsFeedState extends State<ShortsFeed> {
   void _onEvent(ShortsEvent e) {
     if (e is ReadyEvent) {
       _completePreview(e.index, triggerPlayback: true);
+      if (!_firstFrameSeen.contains(e.index)) {
+        Future.delayed(const Duration(milliseconds: 500), () {
+          if (mounted && !_firstFrameSeen.contains(e.index)) {
+            _firstFrameSeen.add(e.index);
+            setState(() {});
+          }
+        });
+      }
     }
     if (e is OnBufferingStart) {
       if (e.index == _current) setState(() => _buffering = true);
@@ -465,11 +476,10 @@ class _ShortsFeedState extends State<ShortsFeed> {
   }
 
   Future<void> _changePage(int i) async {
-    // Мгновенное переключение без ожидания
+    _ctrl.cancelPrewarm(_current);
     _ctrl.onInactive(_current);
     _current = i;
     
-    // Параллельное выполнение для максимальной скорости
     final futures = <Future>[
       _ctrl.onActive(i, autoPlay: true),
       _ctrl.prewarmAround(i, forward: _effectiveForward(), backward: _effectiveBackward()),
@@ -483,12 +493,12 @@ class _ShortsFeedState extends State<ShortsFeed> {
       _posMs = 0;
       _bufMs = 0;
     });
-    // Не ждем завершения - переключение мгновенное
     unawaited(Future.wait(futures));
   }
 
   Future<void> _ensureThumb(int index) async {
     if (!widget.showThumbnailsWhileBuffering) return;
+
     final external = _externalPreview(index);
     if (external != null) {
       _storeThumbnail(index, external);
@@ -496,8 +506,18 @@ class _ShortsFeedState extends State<ShortsFeed> {
       if (mounted) setState(() {});
       return;
     }
+
     if (_thumbs.containsKey(index)) return;
-    _thumbErrors.remove(index);
+
+    try {
+      final bytes = await _ctrl.getThumbnail(index);
+      if (bytes != null && mounted) {
+        _storeThumbnail(index, MemoryImage(bytes));
+        _thumbErrors.remove(index);
+      }
+    } catch (e) {
+      _thumbErrors.add(index);
+    }
     if (mounted) setState(() {});
   }
 
@@ -777,16 +797,14 @@ class _FeedItemState extends State<_FeedItem>
     final meta = widget.controller.getMeta(widget.index);
     final fit = _calcFitFor(widget.index);
 
-    Widget videoWithFit = Center(
-      child: FittedBox(
-        fit: fit,
-        alignment: Alignment.center,
-        child: SizedBox(
-          width: (meta?.width ?? MediaQuery.of(context).size.width).toDouble(),
-          height: (meta?.height ?? (MediaQuery.of(context).size.width * 16 / 9))
-              .toDouble(),
-          child: ShortsView(index: widget.index),
-        ),
+    Widget videoWithFit = FittedBox(
+      fit: fit,
+      alignment: Alignment.center,
+      child: SizedBox(
+        width: (meta?.width ?? MediaQuery.of(context).size.width).toDouble(),
+        height: (meta?.height ?? (MediaQuery.of(context).size.width * 16 / 9))
+            .toDouble(),
+        child: ShortsView(index: widget.index),
       ),
     );
 

@@ -37,7 +37,12 @@ final class PlayerPool {
     weak var methodInvoker: MethodInvoker?
 
 
-  private let thumbCache = NSCache<NSNumber, NSData>()
+  private lazy var thumbCache: NSCache<NSNumber, NSData> = {
+    let cache = NSCache<NSNumber, NSData>()
+    cache.countLimit = 50
+    cache.totalCostLimit = 50 * 1024 * 1024
+    return cache
+  }()
   private let thumbnailSampleSeconds: [Double] = [0.0, 0.12, 0.3, 0.6, 1.0, 1.6]
   private lazy var thumbnailSampleTimes: [CMTime] = thumbnailSampleSeconds.map {
     CMTime(seconds: $0, preferredTimescale: 600)
@@ -253,9 +258,8 @@ final class PlayerPool {
     currentIndex = index
     prime(index: index)
     // ограничиваем окно: активный + соседи
-    for key in entries.keys where abs(key - index) > 1 {
-      dispose(index: key)
-    }
+    let toDispose = entries.keys.filter { abs($0 - index) > 2 }
+    toDispose.forEach { dispose(index: $0) }
     send(["type":"ready","index": index])
     attachViewIfPossible(index: index)
   }
@@ -376,6 +380,11 @@ final class PlayerPool {
   func getVariants(index: Int) -> [[String: Any]] {
     guard let e = entries[index] else { return [["label":"Auto"]] }
     return e.host.getVariants()
+  }
+
+  func getPlaybackInfo(index: Int) -> [String: Any?] {
+    guard let e = entries[index] else { return [:] }
+    return e.host.getPlaybackInfo()
   }
 
   private func send(_ payload: [String: Any]) { onEvent?(payload) }

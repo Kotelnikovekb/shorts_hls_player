@@ -25,17 +25,17 @@ apply plugin: "com.android.library"
 apply plugin: "kotlin-android"
 
 android {
-    namespace = "dev.kotelnikoff.shorts_hls_player"
+    namespace "dev.kotelnikoff.shorts_hls_player"
 
-    compileSdk = 36
+    compileSdk 36
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_11
-        targetCompatibility = JavaVersion.VERSION_11
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
     }
 
     kotlinOptions {
-        jvmTarget = JavaVersion.VERSION_11
+        jvmTarget = "11"
     }
 
     sourceSets {
@@ -44,7 +44,7 @@ android {
     }
 
     defaultConfig {
-        minSdk = 24
+        minSdk 24
     }
 
     dependencies {
