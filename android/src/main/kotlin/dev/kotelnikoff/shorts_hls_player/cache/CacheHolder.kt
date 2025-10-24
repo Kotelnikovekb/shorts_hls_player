@@ -194,13 +194,30 @@ internal object CacheHolder {
             if (state == CacheState.READY) return it
         }
 
-        synchronized(this) {
+        // Используем ReentrantLock вместо synchronized для избежания deadlock
+        val lock = java.util.concurrent.locks.ReentrantLock()
+        return lock.withLock {
             cache?.let {
                 if (state == CacheState.READY) return it
             }
 
             if (state == CacheState.INITIALIZING) {
-                throw IllegalStateException("Cache is already being initialized")
+                Log.w(TAG, "Cache is already being initialized, waiting...")
+                // Ждем завершения инициализации с таймаутом
+                val startTime = System.currentTimeMillis()
+                val timeoutMs = 10000L // 10 секунд
+                
+                while (state == CacheState.INITIALIZING && (System.currentTimeMillis() - startTime) < timeoutMs) {
+                    Thread.sleep(50)
+                }
+                
+                if (state == CacheState.INITIALIZING) {
+                    Log.e(TAG, "Cache initialization timeout after ${timeoutMs}ms")
+                    throw IllegalStateException("Cache initialization timeout")
+                }
+                
+                cache?.let { return it }
+                throw IllegalStateException("Cache initialization failed")
             }
 
             if (initializationFailed) {
@@ -211,7 +228,7 @@ internal object CacheHolder {
 
             state = CacheState.INITIALIZING
 
-            return try {
+            try {
                 prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 loadPersistedMetrics()
 
@@ -299,12 +316,24 @@ internal object CacheHolder {
 
     private fun getOrCreateDatabaseProvider(context: Context): DatabaseProvider {
         return databaseProvider ?: try {
-            StandaloneDatabaseProvider(context.applicationContext).also {
-                databaseProvider = it
-            }
+            Log.d(TAG, "Creating database provider...")
+            val provider = StandaloneDatabaseProvider(context.applicationContext)
+            databaseProvider = provider
+            Log.d(TAG, "Database provider created successfully")
+            provider
         } catch (e: Exception) {
             Log.e(TAG, "Failed to create database provider", e)
-            throw e
+            // Попробуем создать без applicationContext
+            try {
+                Log.d(TAG, "Retrying with regular context...")
+                val provider = StandaloneDatabaseProvider(context)
+                databaseProvider = provider
+                Log.d(TAG, "Database provider created with regular context")
+                provider
+            } catch (e2: Exception) {
+                Log.e(TAG, "Failed to create database provider with regular context", e2)
+                throw e
+            }
         }
     }
 

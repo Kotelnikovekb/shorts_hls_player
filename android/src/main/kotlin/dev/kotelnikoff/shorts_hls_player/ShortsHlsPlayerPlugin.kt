@@ -167,7 +167,7 @@ class ShortsHlsPlayerPlugin :
                 val index = (call.argument<Number>("index") ?: -1).toInt()
                 if (index < 0) { result.error("INVALID_INDEX", "Index must be >= 0", null); return }
                 val slot = textureSlots.getOrPut(index) { TextureSlot(textures) }
-                val textureId = slot.create()
+                val textureId = slot.create().value
                 val surface = slot.getSurface()
                 if (surface == null) { result.error("NO_SURFACE", "Surface is null for index=$index", null); return }
                 pool?.registerSurface(index, surface)
