@@ -8,8 +8,6 @@ void main() {
   runApp(const DemoApp());
 }
 
-// cd /Users/ruzibekov/Projects/shorts_hls_player/example && flutter run
-
 class DemoApp extends StatelessWidget {
   const DemoApp({super.key});
   @override
