@@ -148,7 +148,7 @@ class _DemoHomeState extends State<DemoHome> {
       qualityPreset: ShortsQuality.auto,
       showThumbnailsWhileBuffering: true,
       previewImageBuilder: (index) => NetworkImage(
-        'https://picsum.photos/720/1280?random=$index',
+        'https://placehold.co/720x1280',
       ),
       overlayBuilder: (ctx, index, st) {
         return Align(
